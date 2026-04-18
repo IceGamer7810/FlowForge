@@ -254,6 +254,41 @@ button.secondary:hover { background: #383838; }
   padding: 7px 8px;
 }
 
+.settings-span-2 {
+  grid-column: span 2;
+}
+
+.belt-speed-config {
+  display: grid;
+  gap: 8px;
+}
+
+.belt-speed-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 34px;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.belt-speed-row.valid {
+  border-color: rgba(143, 214, 148, 0.45);
+}
+
+.belt-speed-row .footnote {
+  grid-column: 1 / -1;
+}
+
+.speed-swatch {
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+}
+
 .unit { color: var(--muted); white-space: nowrap; }
 
 .clock-panel {
@@ -440,60 +475,58 @@ svg { width: 100%; display: block; min-height: 430px; }
 .board-placeholder { fill: #6f6348; font-size: 18px; font-weight: 700; }
 .board-placeholder-sub { fill: #7b7058; font-size: 12px; }
 
-.graph-node rect {
-  fill: rgba(255, 255, 255, 0.9);
-  stroke: rgba(50, 41, 29, 0.55);
-  stroke-width: 1.3;
+.factory-machine rect {
   rx: 12;
   ry: 12;
-  filter: drop-shadow(0 8px 10px rgba(0, 0, 0, 0.08));
+  filter: drop-shadow(0 8px 10px rgba(0, 0, 0, 0.1));
 }
 
-.graph-node .accent { stroke: none; rx: 12; ry: 12; }
-.graph-label { fill: #2f2418; font-size: 14px; font-weight: 700; }
-.graph-sub { fill: #534632; font-size: 11px; }
-.graph-node-merge {
-  cursor: grab;
-}
-.edge-label {
-  font-size: 11px;
+.factory-machine-label,
+.factory-output-label,
+.factory-label {
+  fill: #2f2418;
+  font-size: 13px;
   font-weight: 700;
-  paint-order: stroke;
-  stroke: rgba(255, 255, 255, 0.9);
-  stroke-width: 3px;
-  stroke-linejoin: round;
 }
 
-.edge-hit { fill: none; stroke: transparent; stroke-width: 18px; }
-.merge-group { cursor: pointer; }
-.merge-group .edge-main, .merge-group .edge-outline { transition: 0.15s ease; }
-.merge-group:hover .edge-main { stroke: #ff4d4d !important; stroke-width: 4.5 !important; }
-.merge-group:hover .edge-outline { stroke: rgba(255, 255, 255, 0.95) !important; stroke-width: 8 !important; }
-.merge-block {
-  transition: transform 160ms ease;
-  transform-box: fill-box;
-}
-.merge-block-dragging {
-  transition: none !important;
-}
-.merge-block-body {
-  fill: rgba(106, 91, 60, 0.08);
-  stroke: rgba(106, 91, 60, 0.32);
-  stroke-dasharray: 8 5;
-  rx: 16;
-  ry: 16;
-  cursor: grab;
+.factory-machine-sub,
+.factory-sub {
+  fill: #544730;
+  font-size: 11px;
 }
 
-.machine-box rect {
-  fill: rgba(84, 65, 34, 0.14);
-  stroke: rgba(84, 65, 34, 0.5);
-  stroke-dasharray: 6 4;
-  rx: 12;
-  ry: 12;
+.factory-belt line {
+  vector-effect: non-scaling-stroke;
 }
 
-.machine-box text { fill: #4a3d2b; font-size: 11px; font-weight: 700; }
+.factory-source circle,
+.factory-machine circle {
+  filter: drop-shadow(0 4px 5px rgba(0, 0, 0, 0.12));
+}
+
+.factory-tooltip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 10000;
+  max-width: 220px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: rgba(26, 26, 26, 0.94);
+  color: #f5f1e6;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.22);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: pre-line;
+  pointer-events: none;
+  opacity: 0;
+  transform: translate3d(0, 0, 0);
+}
+
+.factory-tooltip.visible {
+  opacity: 1;
+}
 .footnote { font-size: 12px; color: var(--muted); }
 
 #color-picker-root {

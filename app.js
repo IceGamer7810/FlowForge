@@ -1,6 +1,6 @@
 const STORAGE_KEY = "flowforge-state-v2";
 const CLOCK_SLIDER_MIN = 0.01;
-const CLOCK_SLIDER_MAX = 250;
+const CLOCK_SLIDER_MAX = 100;
 const CLOCK_STEP = 1;
 
 const uid = (() => {
@@ -37,18 +37,33 @@ function emptyRecipe() {
   };
 }
 
+function emptyBeltSpeedRow() {
+  return { id: uid("speed"), speed: "", color: "" };
+}
+
+function defaultBeltSpeedRows() {
+  return [
+    { id: uid("speed"), speed: "60", color: "blue" },
+    { id: uid("speed"), speed: "120", color: "red" },
+    { id: uid("speed"), speed: "270", color: "yellow" },
+    { id: uid("speed"), speed: "480", color: "limegreen" },
+    { id: uid("speed"), speed: "780", color: "orange" },
+    emptyBeltSpeedRow()
+  ];
+}
+
 function createDefaultState() {
   return {
     itemRows: [emptyItemRow()],
     machineClassRows: [emptyMachineClassRow()],
     recipes: [],
     settings: {
-      beltSpeeds: "60, 120, 270, 480, 780",
+      beltSpeeds: defaultBeltSpeedRows(),
       splitterSizes: "2, 3",
       mergerSizes: "2, 3",
       maxPower: "1000",
-      clockMin: "1",
-      clockMax: "250",
+      clockMin: "25",
+      clockMax: "100",
       enableOverflow: true,
       targetOutputItemId: "",
       targetOutputRate: "60"
@@ -58,11 +73,15 @@ function createDefaultState() {
 
 function sanitizeState(input) {
   const base = createDefaultState();
+  const rawSettings = { ...base.settings, ...(input.settings || {}) };
   const next = {
     itemRows: Array.isArray(input.itemRows) ? input.itemRows : base.itemRows,
     machineClassRows: Array.isArray(input.machineClassRows) ? input.machineClassRows : base.machineClassRows,
     recipes: Array.isArray(input.recipes) ? input.recipes : base.recipes,
-    settings: { ...base.settings, ...(input.settings || {}) }
+    settings: {
+      ...rawSettings,
+      beltSpeeds: sanitizeBeltSpeedRowsInput(rawSettings.beltSpeeds)
+    }
   };
 
   next.itemRows = next.itemRows.map((row) => ({
@@ -124,6 +143,7 @@ let recipeModalState = {
 };
 
 let globalEventsBound = false;
+let tooltipEventsBound = false;
 
 function saveLocal() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -147,6 +167,11 @@ function ceilTwoDecimals(num) {
   return Math.ceil(num * 100) / 100;
 }
 
+function computeClockedPower(basePower, clockPercent) {
+  if (!(basePower > 0) || !(clockPercent > 0)) return 0;
+  return basePower * Math.pow(clockPercent / 100, 1.321928);
+}
+
 function fmt(num, digits = 2) {
   if (!Number.isFinite(num)) return "0";
   return Number(num.toFixed(digits)).toString();
@@ -167,6 +192,34 @@ function parseListNumbers(text, integerOnly = false) {
     .sort((a, b) => a - b);
 }
 
+function sanitizeBeltSpeedRowsInput(inputValue) {
+  if (Array.isArray(inputValue)) {
+    const rows = inputValue.map((row) => ({
+      id: row.id || uid("speed"),
+      speed: String(row.speed ?? ""),
+      color: String(row.color ?? "")
+    }));
+    return rows.length ? rows : defaultBeltSpeedRows();
+  }
+
+  if (typeof inputValue === "string") {
+    const speeds = parseListNumbers(inputValue, false);
+    if (speeds.length) {
+      const fallbackColors = ["blue", "red", "yellow", "limegreen", "orange", "cyan", "tomato"];
+      return [
+        ...speeds.map((speed, index) => ({
+          id: uid("speed"),
+          speed: String(speed),
+          color: fallbackColors[index % fallbackColors.length]
+        })),
+        emptyBeltSpeedRow()
+      ];
+    }
+  }
+
+  return defaultBeltSpeedRows();
+}
+
 function getClockSliderValue(value) {
   const parsed = parseNumber(String(value));
   if (parsed === null) return Math.round(CLOCK_SLIDER_MIN);
@@ -174,12 +227,12 @@ function getClockSliderValue(value) {
 }
 
 function getSettingsNumbers(targetState = state) {
-  const beltSpeeds = parseListNumbers(targetState.settings.beltSpeeds, false);
+  const beltSpeeds = getDefinedBeltSpeeds(targetState);
   const splitterSizes = parseListNumbers(targetState.settings.splitterSizes, true);
   const mergerSizes = parseListNumbers(targetState.settings.mergerSizes, true);
   const maxPower = parseNumber(targetState.settings.maxPower) ?? 0;
   const minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(targetState.settings.clockMin) ?? 1, CLOCK_SLIDER_MAX));
-  const maxClock = Math.max(minClock, Math.min(parseNumber(targetState.settings.clockMax) ?? 250, CLOCK_SLIDER_MAX));
+  const maxClock = 100;
   const enableOverflow = Boolean(targetState.settings.enableOverflow);
   const targetOutputRate = parseNumber(targetState.settings.targetOutputRate) ?? 0;
   return {
@@ -227,6 +280,15 @@ function parseCssColorToHex(value) {
   if (!match) return "#ff0000";
   const [r, g, b] = match.slice(1).map((part) => Number(part));
   return `#${[r, g, b].map((part) => part.toString(16).padStart(2, "0")).join("")}`;
+}
+
+function contrastColor(color) {
+  const normalized = parseCssColorToHex(color);
+  const r = parseInt(normalized.slice(1, 3), 16);
+  const g = parseInt(normalized.slice(3, 5), 16);
+  const b = parseInt(normalized.slice(5, 7), 16);
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+  return luminance > 0.6 ? "#111111" : "#ffffff";
 }
 
 function hexToRgb(hex) {
@@ -341,6 +403,45 @@ function bindGlobalEvents() {
   globalEventsBound = true;
 }
 
+function ensureFactoryTooltipRoot() {
+  let root = document.getElementById("factory-tooltip-root");
+  if (!root) {
+    root = document.createElement("div");
+    root.id = "factory-tooltip-root";
+    root.className = "factory-tooltip";
+    document.body.appendChild(root);
+  }
+  return root;
+}
+
+function hideFactoryTooltip() {
+  const root = ensureFactoryTooltipRoot();
+  root.classList.remove("visible");
+}
+
+function showFactoryTooltip(text, clientX, clientY) {
+  const root = ensureFactoryTooltipRoot();
+  root.textContent = text;
+  root.style.left = `${clientX + 14}px`;
+  root.style.top = `${clientY + 14}px`;
+  root.classList.add("visible");
+}
+
+function bindFactoryTooltipEvents() {
+  if (tooltipEventsBound) return;
+  document.addEventListener("mousemove", (event) => {
+    const target = event.target instanceof Element ? event.target.closest("[data-factory-tooltip]") : null;
+    if (!target) {
+      hideFactoryTooltip();
+      return;
+    }
+    showFactoryTooltip(target.getAttribute("data-factory-tooltip") || "", event.clientX, event.clientY);
+  });
+  document.addEventListener("mouseleave", hideFactoryTooltip);
+  document.addEventListener("scroll", hideFactoryTooltip, true);
+  tooltipEventsBound = true;
+}
+
 function isItemRowEmpty(row) {
   return !row.name.trim() && !row.color.trim();
 }
@@ -417,8 +518,42 @@ function ensureMachineClassRows(targetState = state) {
   if (!targetState.machineClassRows.length || allValid) targetState.machineClassRows.push(emptyMachineClassRow());
 }
 
+function getBeltSpeedStatuses(targetState = state) {
+  const meaningfulRows = (targetState.settings.beltSpeeds || []).filter((row) => row.speed.trim() || row.color.trim());
+  const speedCounts = new Map();
+  meaningfulRows.forEach((row) => {
+    const speedKey = normalizeNumericString(row.speed, 6);
+    if (speedKey) speedCounts.set(speedKey, (speedCounts.get(speedKey) || 0) + 1);
+  });
+
+  const statuses = new Map();
+  (targetState.settings.beltSpeeds || []).forEach((row) => {
+    const speedKey = normalizeNumericString(row.speed, 6);
+    const speedNum = parseNumber(row.speed);
+    statuses.set(row.id, {
+      empty: !row.speed.trim() && !row.color.trim(),
+      valid: Boolean(speedKey && speedNum !== null && speedNum > 0 && isValidColor(row.color) && speedCounts.get(speedKey) === 1)
+    });
+  });
+  return statuses;
+}
+
+function ensureBeltSpeedRows(targetState = state) {
+  const rows = (targetState.settings.beltSpeeds || []).filter((row) => row.speed.trim() || row.color.trim());
+  const statuses = getBeltSpeedStatuses({ ...targetState, settings: { ...targetState.settings, beltSpeeds: rows } });
+  const trimmed = [];
+  for (const row of rows) {
+    trimmed.push(row);
+    if (!statuses.get(row.id)?.valid) break;
+  }
+  const current = trimmed.length ? trimmed : [];
+  const recalculated = getBeltSpeedStatuses({ ...targetState, settings: { ...targetState.settings, beltSpeeds: current } });
+  const allValid = current.length > 0 && current.every((row) => recalculated.get(row.id)?.valid);
+  targetState.settings.beltSpeeds = allValid || !current.length ? [...current, emptyBeltSpeedRow()] : current;
+}
+
 function sanitizeBeltSelections(targetState = state) {
-  const validBeltValues = new Set(parseListNumbers(targetState.settings.beltSpeeds, false).map((value) => String(value)));
+  const validBeltValues = new Set(getDefinedBeltSpeeds(targetState).map((entry) => String(entry.speed)));
   targetState.itemRows.forEach((row) => {
     row.belts.forEach((belt) => {
       if (belt.value !== "" && !validBeltValues.has(String(belt.value))) belt.value = "";
@@ -434,6 +569,7 @@ function ensureTrailingBelts(itemRow) {
 function ensureStateStructure(targetState = state) {
   ensureItemRows(targetState);
   ensureMachineClassRows(targetState);
+  ensureBeltSpeedRows(targetState);
   sanitizeBeltSelections(targetState);
   targetState.itemRows.forEach((row) => ensureTrailingBelts(row));
   targetState.recipes = targetState.recipes.map((recipe) => sanitizeRecipe(recipe));
@@ -455,6 +591,19 @@ function getDefinedMachineClasses(targetState = state) {
   return targetState.machineClassRows
     .filter((row) => statuses.get(row.id)?.valid)
     .map((row) => ({ id: row.id, name: row.name.trim(), power: parseNumber(row.power) || 0 }));
+}
+
+function getDefinedBeltSpeeds(targetState = state) {
+  const statuses = getBeltSpeedStatuses(targetState);
+  return (targetState.settings.beltSpeeds || [])
+    .filter((row) => statuses.get(row.id)?.valid)
+    .map((row) => ({
+      id: row.id,
+      speed: parseNumber(row.speed) || 0,
+      speedText: normalizeNumericString(row.speed, 6),
+      color: row.color.trim()
+    }))
+    .sort((a, b) => a.speed - b.speed);
 }
 
 function getMachineClassMap(targetState = state) {
@@ -606,35 +755,74 @@ function chooseRecipeCandidate(candidates, requiredRate, settings, machineMap) {
   let best = null;
   candidates.forEach((recipe) => {
     const machine = machineMap.get(recipe.machineClassId);
-    const outputQty = parseNumber(recipe.outputQty);
-    const baseRate = parseNumber(recipe.itemsPerMinute);
-    if (!machine || outputQty === null || outputQty <= 0 || baseRate === null || baseRate <= 0) return;
-
-    let machineCount = Math.max(1, Math.ceil(requiredRate / (baseRate * settings.maxClock / 100)));
-    let clock = ceilTwoDecimals(requiredRate / (baseRate * machineCount) * 100);
-    while (clock > settings.maxClock) {
-      machineCount += 1;
-      clock = ceilTwoDecimals(requiredRate / (baseRate * machineCount) * 100);
-    }
-
-    let actualRate = requiredRate;
-    let overflowRate = 0;
-    if (clock < settings.minClock) {
-      if (!settings.enableOverflow) return;
-      clock = settings.minClock;
-      actualRate = baseRate * machineCount * (clock / 100);
-      overflowRate = Math.max(0, actualRate - requiredRate);
-    } else {
-      actualRate = baseRate * machineCount * (clock / 100);
-      overflowRate = Math.max(0, actualRate - requiredRate);
-    }
-
-    const powerUse = machineCount * machine.power * (clock / 100);
-    const score = powerUse * 1000 + machineCount * 10 + overflowRate;
-    const candidate = { recipe, machine, outputQty, baseRate, machineCount, clock, actualRate, overflowRate, powerUse, score };
+    const operatingPoint = computeRecipeOperatingPoint(recipe, machine, requiredRate, settings);
+    if (!(operatingPoint.actualRate > 0)) return;
+    const score = operatingPoint.powerUse * 1000 + operatingPoint.overflowRate * 10 + operatingPoint.machineCount;
+    const candidate = { recipe, machine, ...operatingPoint, score };
     if (!best || candidate.score < best.score) best = candidate;
   });
   return best;
+}
+
+function getRecipeBaseOutputRate(recipe) {
+  const speed = parseNumber(recipe.itemsPerMinute);
+  const outputQty = parseNumber(recipe.outputQty);
+  const firstValidInput = (recipe.inputs || [])
+    .map((row) => parseNumber(row.qty))
+    .find((qty) => qty !== null && qty > 0);
+
+  if (speed === null || speed <= 0 || outputQty === null || outputQty <= 0) return 0;
+  const referenceInputQty = firstValidInput || outputQty;
+  return speed * (outputQty / referenceInputQty);
+}
+
+function computeRecipeOperatingPoint(recipe, machine, requestedRate, settings) {
+  const outputQty = parseNumber(recipe.outputQty);
+  const baseRate = getRecipeBaseOutputRate(recipe);
+  if (!machine || outputQty === null || outputQty <= 0 || baseRate === null || baseRate <= 0 || !(requestedRate > 0)) {
+    return {
+      outputQty: outputQty || 0,
+      baseRate: baseRate || 0,
+      machineCount: 0,
+      clock: 0,
+      actualRate: 0,
+      overflowRate: 0,
+      powerUse: 0
+    };
+  }
+  const safeMinClock = Math.max(CLOCK_SLIDER_MIN, Math.min(settings.minClock, 100));
+  const fullMachines = Math.floor(requestedRate / baseRate);
+  const remainder = Math.max(0, requestedRate - fullMachines * baseRate);
+  const hasRemainderMachine = remainder > 1e-9;
+  const rawClock = hasRemainderMachine ? (remainder / baseRate) * 100 : 0;
+  const remainderClock = hasRemainderMachine ? Math.max(rawClock, safeMinClock) : 0;
+  const machineCount = fullMachines + (hasRemainderMachine ? 1 : 0);
+  const actualRate = fullMachines * baseRate + (hasRemainderMachine ? baseRate * (remainderClock / 100) : 0);
+  const overflowRate = Math.max(0, actualRate - requestedRate);
+  const fullMachinePower = fullMachines * computeClockedPower(machine.power, 100);
+  const remainderPower = hasRemainderMachine ? computeClockedPower(machine.power, remainderClock) : 0;
+  const powerUse = fullMachinePower + remainderPower;
+  const clock = hasRemainderMachine ? remainderClock : 100;
+  const instanceClocks = [
+    ...Array.from({ length: fullMachines }, () => 100),
+    ...(hasRemainderMachine ? [remainderClock] : [])
+  ];
+  const instanceRates = instanceClocks.map((instanceClock) => baseRate * (instanceClock / 100));
+  return {
+    outputQty,
+    baseRate,
+    machineCount,
+    clock,
+    actualRate,
+    overflowRate,
+    powerUse,
+    fullMachines,
+    hasRemainderMachine,
+    rawClock,
+    remainderClock,
+    instanceClocks,
+    instanceRates
+  };
 }
 
 function mergeMaps(target, source) {
@@ -722,6 +910,7 @@ function solveFactory(targetState = state) {
   const planMap = new Map();
   const externalDemand = new Map();
   const overflowBelts = [];
+  const remainingExternal = new Map(roleState.externalRates);
   let nextOverflowBelt = 1;
 
   function solveItem(itemId, requiredRate, trail = []) {
@@ -730,8 +919,11 @@ function solveFactory(targetState = state) {
     if (!item) return { ok: false, error: "Unknown item in solver." };
 
     if (roleState.externalInputIds.has(itemId)) {
-      const node = { type: "external", itemId, label: item.name, rate: requiredRate, children: [] };
       externalDemand.set(itemId, (externalDemand.get(itemId) || 0) + requiredRate);
+      const available = remainingExternal.get(itemId) || 0;
+      const deliveredRate = Math.min(requiredRate, available);
+      remainingExternal.set(itemId, Math.max(0, available - deliveredRate));
+      const node = { type: "external", itemId, label: item.name, rate: deliveredRate, requestedRate: requiredRate, children: [] };
       return { ok: true, node, power: 0 };
     }
 
@@ -740,18 +932,25 @@ function solveFactory(targetState = state) {
     if (!chosen) return { ok: false, error: `${item.name} is not externally supplied and no valid recipe can produce it.` };
 
     const inputNodes = [];
+    const inputLimitedRates = [];
     for (const row of chosen.recipe.inputs) {
       const qty = parseNumber(row.qty);
       if (!row.itemId || qty === null || qty <= 0) continue;
-      const neededRate = chosen.actualRate * qty / chosen.outputQty;
+      const neededRate = requiredRate * qty / chosen.outputQty;
       const inputResult = solveItem(row.itemId, neededRate, [...trail, itemId]);
       if (!inputResult.ok) return inputResult;
       inputNodes.push(inputResult.node);
+      const deliveredInputRate = inputResult.node.actualRate || inputResult.node.rate || 0;
+      inputLimitedRates.push(deliveredInputRate * chosen.outputQty / qty);
     }
 
-    if (chosen.overflowRate > 0) {
+    const maxSupportedRate = inputLimitedRates.length ? Math.min(...inputLimitedRates) : requiredRate;
+    const desiredRate = Math.max(0, Math.min(requiredRate, maxSupportedRate));
+    const operatingPoint = computeRecipeOperatingPoint(chosen.recipe, chosen.machine, desiredRate, settings);
+
+    if (operatingPoint.overflowRate > 0) {
       const beltId = nextOverflowBelt++;
-      overflowBelts.push({ id: beltId, itemId, itemName: item.name, rate: chosen.overflowRate, recipeId: chosen.recipe.id });
+      overflowBelts.push({ id: beltId, itemId, itemName: item.name, rate: operatingPoint.overflowRate, recipeId: chosen.recipe.id });
       warnings.push(`The recipe ${item.name} produces more output per power than a tighter-fit alternative. Excess will be generated. Overflow belt assigned: Belt ${beltId}`);
     }
 
@@ -774,14 +973,14 @@ function solveFactory(targetState = state) {
 
     const plan = planMap.get(chosen.recipe.id);
     plan.requiredRate += requiredRate;
-    plan.actualRate += chosen.actualRate;
-    plan.machineCount += chosen.machineCount;
-    plan.powerUse += chosen.powerUse;
-    plan.clock = Math.max(plan.clock, chosen.clock);
+    plan.actualRate += operatingPoint.actualRate;
+    plan.machineCount += operatingPoint.machineCount;
+    plan.powerUse += operatingPoint.powerUse;
+    plan.clock = Math.max(plan.clock, operatingPoint.clock);
 
     return {
       ok: true,
-      power: chosen.powerUse + inputNodes.reduce((sum, node) => sum + (node.powerUse || 0), 0),
+      power: operatingPoint.powerUse + inputNodes.reduce((sum, node) => sum + (node.powerUse || 0), 0),
       node: {
         type: "recipe",
         recipeId: chosen.recipe.id,
@@ -789,16 +988,26 @@ function solveFactory(targetState = state) {
         label: item.name,
         machineName: chosen.machine.name,
         requiredRate,
-        actualRate: chosen.actualRate,
-        overflowRate: chosen.overflowRate,
+        actualRate: operatingPoint.actualRate,
+        overflowRate: operatingPoint.overflowRate,
+        machineCount: operatingPoint.machineCount,
+        instanceClocks: operatingPoint.instanceClocks,
+        instanceRates: operatingPoint.instanceRates,
         children: inputNodes,
-        powerUse: chosen.powerUse
+        powerUse: operatingPoint.powerUse
       }
     };
   }
 
   const targetResult = solveItem(settings.targetOutputItemId, targetRate, []);
   if (!targetResult.ok) errors.push(targetResult.error);
+  const producedTargetRate = targetResult.ok
+    ? (targetResult.node.actualRate || targetResult.node.rate || 0)
+    : 0;
+
+  if (targetResult.ok && producedTargetRate + 1e-9 < targetRate) {
+    errors.push(`Target output is under-satisfied. Required ${fmt(targetRate)} item/min, produced ${fmt(producedTargetRate)} item/min.`);
+  }
 
   externalDemand.forEach((demand, itemId) => {
     const available = roleState.externalRates.get(itemId) || 0;
@@ -825,89 +1034,586 @@ function solveFactory(targetState = state) {
     overflowBelts,
     warnings: [...new Set(warnings)],
     errors,
-    reachable: errors.length === 0 && Boolean(targetResult.ok),
+    reachable: errors.length === 0 && Boolean(targetResult.ok) && producedTargetRate + 1e-9 >= targetRate,
+    producedTargetRate,
     targetNode: targetResult.ok ? targetResult.node : null
   };
 }
 
-function treeDepth(node) {
+function nodeTreeDepth(node) {
   if (!node) return 0;
   if (!node.children?.length) return 1;
-  return 1 + Math.max(...node.children.map(treeDepth));
+  return 1 + Math.max(...node.children.map(nodeTreeDepth));
 }
 
-function assignTreePositions(node, depth = 0, positions = [], cursor = { y: 80 }) {
-  if (!node) return positions;
+function nodeLeafCount(node) {
+  if (!node?.children?.length) return 1;
+  return node.children.reduce((sum, child) => sum + nodeLeafCount(child), 0);
+}
+
+function averageHexColors(colors) {
+  const valid = colors.filter((color) => isValidColor(color));
+  if (!valid.length) return "#8c836a";
+  const totals = valid.reduce((sum, color) => {
+    const rgb = hexToRgb(color);
+    sum.r += rgb.r;
+    sum.g += rgb.g;
+    sum.b += rgb.b;
+    return sum;
+  }, { r: 0, g: 0, b: 0 });
+  return rgbToHex(totals.r / valid.length, totals.g / valid.length, totals.b / valid.length);
+}
+
+function getNodeItemColor(node, itemMap) {
+  if (!node) return "#6b6250";
+  const itemId = node.outputItemId || node.itemId;
+  return itemMap.get(itemId)?.color || "#6b6250";
+}
+
+function chooseBeltSpeedForRate(rate, beltSpeeds) {
+  if (!beltSpeeds.length) return null;
+  const target = Math.max(0, rate || 0);
+  const sorted = [...beltSpeeds].sort((a, b) => a.speed - b.speed);
+  return sorted.find((entry) => entry.speed >= target) || sorted[sorted.length - 1];
+}
+
+function beltStrokeWidth(rate, beltSpeed) {
+  if (!beltSpeed || !beltSpeed.speed) return 5;
+  const ratio = Math.max(0.35, Math.min(1, rate / beltSpeed.speed));
+  return 4 + ratio * 4;
+}
+
+function computeFactoryLayout(node, level = 0, leafCursor = { value: 0 }, layouts = []) {
+  if (!node) return layouts;
   const children = node.children || [];
+  let x;
   if (!children.length) {
-    const y = cursor.y;
-    cursor.y += 120;
-    positions.push({ node, depth, x: 100 + depth * 260, y });
-    return positions;
+    x = 140 + leafCursor.value * 220;
+    leafCursor.value += 1;
+  } else {
+    const childLayouts = [];
+    children.forEach((child) => computeFactoryLayout(child, level + 1, leafCursor, childLayouts));
+    x = childLayouts.reduce((sum, entry) => sum + entry.x, 0) / childLayouts.length;
+    childLayouts.forEach((entry) => layouts.push(entry));
   }
-  const childPositions = [];
-  children.forEach((child) => assignTreePositions(child, depth + 1, childPositions, cursor));
-  const y = childPositions.reduce((sum, entry) => sum + entry.y, 0) / childPositions.length;
-  positions.push({ node, depth, x: 100 + depth * 260, y });
-  childPositions.forEach((entry) => positions.push(entry));
-  return positions;
+  layouts.push({ node, level, x });
+  return layouts;
+}
+
+function makeOrthogonalSegments(points) {
+  const segments = [];
+  for (let index = 1; index < points.length; index += 1) {
+    const a = points[index - 1];
+    const b = points[index];
+    if (a.x === b.x && a.y === b.y) continue;
+    segments.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, overpass: false });
+  }
+  return segments;
+}
+
+function segmentIsHorizontal(segment) {
+  return segment.y1 === segment.y2;
+}
+
+function segmentLength(segment) {
+  return Math.abs(segment.x2 - segment.x1) + Math.abs(segment.y2 - segment.y1);
+}
+
+function nonEndpointCrossing(horizontal, vertical) {
+  const hx1 = Math.min(horizontal.x1, horizontal.x2);
+  const hx2 = Math.max(horizontal.x1, horizontal.x2);
+  const vy1 = Math.min(vertical.y1, vertical.y2);
+  const vy2 = Math.max(vertical.y1, vertical.y2);
+  const x = vertical.x1;
+  const y = horizontal.y1;
+  const horizontalHit = x > hx1 && x < hx2;
+  const verticalHit = y > vy1 && y < vy2;
+  return horizontalHit && verticalHit;
+}
+
+function rangesOverlap(a1, a2, b1, b2) {
+  const minA = Math.min(a1, a2);
+  const maxA = Math.max(a1, a2);
+  const minB = Math.min(b1, b2);
+  const maxB = Math.max(b1, b2);
+  return Math.min(maxA, maxB) - Math.max(minA, minB) > 1e-9;
+}
+
+function segmentsParallelOverlap(a, b) {
+  const aHorizontal = segmentIsHorizontal(a);
+  const bHorizontal = segmentIsHorizontal(b);
+  if (aHorizontal !== bHorizontal) return false;
+  if (aHorizontal) {
+    return a.y1 === b.y1 && rangesOverlap(a.x1, a.x2, b.x1, b.x2);
+  }
+  return a.x1 === b.x1 && rangesOverlap(a.y1, a.y2, b.y1, b.y2);
+}
+
+function shiftSegmentPerpendicular(belt, segmentIndex, delta) {
+  const segment = belt.segments[segmentIndex];
+  if (!segment || delta === 0) return;
+  const original = { ...segment };
+  const horizontal = segmentIsHorizontal(segment);
+
+  if (horizontal) {
+    segment.y1 += delta;
+    segment.y2 += delta;
+    const prev = belt.segments[segmentIndex - 1];
+    const next = belt.segments[segmentIndex + 1];
+    if (prev) {
+      if (prev.x2 === original.x1 && prev.y2 === original.y1) prev.y2 += delta;
+      if (prev.x1 === original.x1 && prev.y1 === original.y1) prev.y1 += delta;
+    }
+    if (next) {
+      if (next.x1 === original.x2 && next.y1 === original.y2) next.y1 += delta;
+      if (next.x2 === original.x2 && next.y2 === original.y2) next.y2 += delta;
+    }
+  } else {
+    segment.x1 += delta;
+    segment.x2 += delta;
+    const prev = belt.segments[segmentIndex - 1];
+    const next = belt.segments[segmentIndex + 1];
+    if (prev) {
+      if (prev.x2 === original.x1 && prev.y2 === original.y1) prev.x2 += delta;
+      if (prev.x1 === original.x1 && prev.y1 === original.y1) prev.x1 += delta;
+    }
+    if (next) {
+      if (next.x1 === original.x2 && next.y1 === original.y2) next.x1 += delta;
+      if (next.x2 === original.x2 && next.y2 === original.y2) next.x2 += delta;
+    }
+  }
+}
+
+function resolveParallelOverlaps(belts) {
+  const laneStep = 18;
+  for (let beltIndex = 0; beltIndex < belts.length; beltIndex += 1) {
+    const belt = belts[beltIndex];
+    for (let segmentIndex = 0; segmentIndex < belt.segments.length; segmentIndex += 1) {
+      let guard = 0;
+      while (guard < 20) {
+        guard += 1;
+        const segment = belt.segments[segmentIndex];
+        let hasOverlap = false;
+
+        for (let prevBeltIndex = 0; prevBeltIndex <= beltIndex; prevBeltIndex += 1) {
+          const prevBelt = belts[prevBeltIndex];
+          const maxSegmentIndex = prevBeltIndex === beltIndex ? segmentIndex - 1 : prevBelt.segments.length - 1;
+          for (let prevSegmentIndex = 0; prevSegmentIndex <= maxSegmentIndex; prevSegmentIndex += 1) {
+            if (segmentsParallelOverlap(segment, prevBelt.segments[prevSegmentIndex])) {
+              hasOverlap = true;
+              break;
+            }
+          }
+          if (hasOverlap) break;
+        }
+
+        if (!hasOverlap) break;
+        shiftSegmentPerpendicular(belt, segmentIndex, laneStep);
+      }
+    }
+  }
+}
+
+function markOverpasses(belts) {
+  const horizontals = [];
+  const verticals = [];
+  belts.forEach((belt, beltIndex) => {
+    belt.segments.forEach((segment, segmentIndex) => {
+      const descriptor = { beltIndex, segmentIndex, segment };
+      if (segmentIsHorizontal(segment)) horizontals.push(descriptor);
+      else verticals.push(descriptor);
+    });
+  });
+
+  horizontals.forEach((horizontal) => {
+    verticals.forEach((vertical) => {
+      if (horizontal.beltIndex === vertical.beltIndex) return;
+      if (nonEndpointCrossing(horizontal.segment, vertical.segment)) {
+        belts[horizontal.beltIndex].segments[horizontal.segmentIndex].overpass = true;
+      }
+    });
+  });
+}
+
+function segmentDirection(segment) {
+  if (segment.x2 > segment.x1) return "right";
+  if (segment.x2 < segment.x1) return "left";
+  if (segment.y2 > segment.y1) return "down";
+  return "up";
+}
+
+function openArrowPath(x, y, direction, size = 7) {
+  if (direction === "right") return `M ${x - size} ${y - size} L ${x} ${y} L ${x - size} ${y + size}`;
+  if (direction === "left") return `M ${x + size} ${y - size} L ${x} ${y} L ${x + size} ${y + size}`;
+  if (direction === "down") return `M ${x - size} ${y - size} L ${x} ${y} L ${x + size} ${y - size}`;
+  return `M ${x - size} ${y + size} L ${x} ${y} L ${x + size} ${y + size}`;
+}
+
+function renderArrowHeadsForSegment(segment, speedColor, overpass) {
+  const length = segmentLength(segment);
+  if (length < 8) return "";
+  const direction = segmentDirection(segment);
+  const contrast = contrastColor(speedColor);
+  const spacing = 42;
+  const count = Math.max(1, Math.floor(length / spacing));
+  const arrows = [];
+  for (let index = 1; index <= count; index += 1) {
+    const preferredOffset = count === 1 ? length / 2 : index * spacing;
+    const offset = Math.max(8, Math.min(length - 8, preferredOffset));
+    const x = segment.x1 === segment.x2
+      ? segment.x1
+      : (segment.x2 > segment.x1 ? segment.x1 + offset : segment.x1 - offset);
+    const y = segment.y1 === segment.y2
+      ? segment.y1
+      : (segment.y2 > segment.y1 ? segment.y1 + offset : segment.y1 - offset);
+    const path = openArrowPath(x, y, direction);
+    const dash = overpass ? ` stroke-dasharray="4 3"` : "";
+    arrows.push(`<path d="${path}" fill="none" stroke="${contrast}" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
+    arrows.push(`<path d="${path}" fill="none" stroke="${speedColor}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
+  }
+  return arrows.join("");
+}
+
+function renderFactoryBelt(belt) {
+  const itemColor = belt.itemColor || "#6b6250";
+  const speedColor = belt.speedColor || "#ffffff";
+  const tooltipAttr = belt.tooltip ? ` data-factory-tooltip="${escapeHtml(belt.tooltip)}"` : "";
+  return `<g class="factory-belt"${tooltipAttr}>${belt.segments.map((segment) => {
+    const dash = segment.overpass ? ` stroke-dasharray="12 10"` : "";
+    const strokeWidth = segment.strokeWidth || 6;
+    return `
+      <g>
+        <line x1="${segment.x1}" y1="${segment.y1}" x2="${segment.x2}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round"${dash}></line>
+        ${renderArrowHeadsForSegment(segment, speedColor, segment.overpass)}
+      </g>
+    `;
+  }).join("")}</g>`;
+}
+
+function renderFactoryNodeLabel(x, y, title, subtitle) {
+  return `
+    <text x="${x}" y="${y}" text-anchor="middle" class="factory-label">${escapeHtml(title)}</text>
+    <text x="${x}" y="${y + 16}" text-anchor="middle" class="factory-sub">${escapeHtml(subtitle)}</text>
+  `;
+}
+
+function renderRoutingNode(x, y, color, tooltip = "") {
+  const tooltipAttr = tooltip ? ` data-factory-tooltip="${escapeHtml(tooltip)}"` : "";
+  return `<circle cx="${x}" cy="${y}" r="10" fill="${color}" stroke="rgba(60,48,31,0.8)" stroke-width="2"${tooltipAttr}></circle>`;
+}
+
+function findExactFactorChain(target, allowedSizes) {
+  const sizes = [...new Set((allowedSizes || []).filter((size) => Number.isInteger(size) && size > 1))].sort((a, b) => a - b);
+  if (target <= 1) return [];
+  if (!sizes.length) return null;
+
+  const queue = [{ product: 1, factors: [] }];
+  const visited = new Set([1]);
+  while (queue.length) {
+    const current = queue.shift();
+    for (const size of sizes) {
+      const nextProduct = current.product * size;
+      if (nextProduct > target || target % nextProduct !== 0) continue;
+      const nextFactors = [...current.factors, size];
+      if (nextProduct === target) return nextFactors;
+      if (!visited.has(nextProduct)) {
+        visited.add(nextProduct);
+        queue.push({ product: nextProduct, factors: nextFactors });
+      }
+    }
+  }
+  return null;
+}
+
+function partitionTargets(targets, groups) {
+  const size = targets.length / groups;
+  const partitions = [];
+  for (let index = 0; index < groups; index += 1) {
+    partitions.push(targets.slice(index * size, (index + 1) * size));
+  }
+  return partitions;
+}
+
+function routeHV(start, end) {
+  if (start.x === end.x || start.y === end.y) return [start, end];
+  return [start, { x: end.x, y: start.y }, end];
+}
+
+function extendBounds(bounds, x, y) {
+  bounds.minX = Math.min(bounds.minX, x);
+  bounds.maxX = Math.max(bounds.maxX, x);
+  bounds.minY = Math.min(bounds.minY, y);
+  bounds.maxY = Math.max(bounds.maxY, y);
+}
+
+function connectBeltPath(collection, itemColor, speedColor, rate, points) {
+  collection.push({
+    itemColor,
+    speedColor,
+    segments: makeOrthogonalSegments(points).map((segment) => ({ ...segment, strokeWidth: beltStrokeWidth(rate, { speed: rate || 1, color: speedColor }) }))
+  });
 }
 
 function renderSolverBoard(solution) {
   if (!solution.targetNode) {
+    const hasTarget = Boolean(solution.settings.targetOutputItemId);
+    const hasRecipes = state.recipes.length > 0;
+    let title = "Select a target output item";
+    let subtitle = "The production chain will be generated automatically from recipes and external inputs.";
+
+    if (hasTarget && solution.errors.length) {
+      title = "No layout";
+      subtitle = solution.errors[0];
+    } else if (hasTarget && !solution.errors.length) {
+      title = "Resolving production chain";
+      subtitle = "The solver is checking recipe reachability and available external inputs.";
+    } else if (!hasRecipes) {
+      title = "Add a valid recipe";
+      subtitle = "Once a recipe exists and a target is selected, the layout is generated automatically.";
+    }
+
     return `
       <svg viewBox="0 0 1200 480" role="img" aria-label="Solver board">
-        <text x="600" y="200" text-anchor="middle" class="board-placeholder">No solved production chain yet</text>
-        <text x="600" y="230" text-anchor="middle" class="board-placeholder-sub">Define machine classes and recipes, then choose a target output.</text>
+        <text x="600" y="200" text-anchor="middle" class="board-placeholder">${escapeHtml(title)}</text>
+        <text x="600" y="230" text-anchor="middle" class="board-placeholder-sub">${escapeHtml(subtitle)}</text>
       </svg>
     `;
   }
 
-  const positions = assignTreePositions(solution.targetNode);
-  const deduped = [];
-  const seen = new Set();
-  positions.forEach((entry) => {
-    const key = `${entry.node.type}:${entry.node.recipeId || entry.node.itemId}:${entry.depth}:${Math.round(entry.y)}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    deduped.push(entry);
-  });
-
-  const width = Math.max(1200, (treeDepth(solution.targetNode) + 1) * 270 + 180);
-  const height = Math.max(480, deduped.reduce((max, entry) => Math.max(max, entry.y), 120) + 120);
-  const nodeWidth = 190;
-  const nodeHeight = 70;
-
-  let svg = `
-    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Solver board">
-      <defs>
-        <marker id="solver-arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
-          <path d="M0,0 L10,4 L0,8 z" fill="#4b4234"></path>
-        </marker>
-      </defs>
-  `;
-
-  deduped.forEach((entry) => {
-    (entry.node.children || []).forEach((child) => {
-      const childEntry = deduped.find((candidate) => candidate.node === child);
-      if (!childEntry) return;
-      svg += `<path d="M ${childEntry.x + nodeWidth} ${childEntry.y} L ${entry.x} ${entry.y}" fill="none" stroke="#5d533f" stroke-width="2.2" marker-end="url(#solver-arrow)"></path>`;
+  const itemMap = solution.roleState.itemMap;
+  const beltSpeeds = solution.settings.beltSpeeds;
+  const layouts = computeFactoryLayout(solution.targetNode);
+  const maxLevel = Math.max(...layouts.map((entry) => entry.level));
+  const width = Math.max(1200, 280 + Math.max(...layouts.map((entry) => entry.x)));
+  const height = Math.max(560, 220 + (maxLevel + 1) * 230);
+  const machineWidth = 170;
+  const machineHeight = 84;
+  const sourceRadius = 20;
+  const topMargin = 170;
+  const levelGap = 220;
+  const positions = new Map();
+  layouts.forEach((entry) => {
+    positions.set(entry.node, {
+      x: entry.x,
+      y: topMargin + entry.level * levelGap
     });
   });
 
-  deduped.forEach((entry) => {
-    const isExternal = entry.node.type === "external";
-    svg += `
-      <g class="graph-node">
-        <rect x="${entry.x}" y="${entry.y - nodeHeight / 2}" width="${nodeWidth}" height="${nodeHeight}" fill="${isExternal ? "rgba(245,235,210,0.92)" : "rgba(255,255,255,0.92)"}"></rect>
-        <text x="${entry.x + 16}" y="${entry.y - 10}" class="graph-label">${escapeHtml(entry.node.label)}</text>
-        <text x="${entry.x + 16}" y="${entry.y + 10}" class="graph-sub">${escapeHtml(isExternal ? "External input" : entry.node.machineName)}</text>
-        <text x="${entry.x + 16}" y="${entry.y + 28}" class="graph-sub">${escapeHtml(`${fmt(entry.node.actualRate || entry.node.rate)} item/min`)}</text>
-      </g>
-    `;
-  });
+  const belts = [];
+  const outputBelts = [];
+  const renderedNodes = [];
+  const planByRecipeId = new Map(solution.machinePlans.map((plan) => [plan.recipeId, plan]));
+  const layoutBounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
 
-  return `${svg}</svg>`;
+  function addBelt(collection, itemColor, rate, points, itemName = "") {
+    const beltSpeed = chooseBeltSpeedForRate(rate, beltSpeeds);
+    collection.push({
+      itemColor,
+      speedColor: beltSpeed?.color || "#ffffff",
+      tooltip: `${itemName || "Item"}\n${fmt(rate)} item/min`,
+      segments: makeOrthogonalSegments(points).map((segment) => ({ ...segment, strokeWidth: beltStrokeWidth(rate, beltSpeed) }))
+    });
+    points.forEach((point) => extendBounds(layoutBounds, point.x, point.y));
+  }
+
+  function addRoutingNode(x, y, color, tooltip) {
+    renderedNodes.push(`<g class="factory-routing-node">${renderRoutingNode(x, y, color, tooltip)}</g>`);
+    extendBounds(layoutBounds, x - 12, y - 12);
+    extendBounds(layoutBounds, x + 12, y + 12);
+  }
+
+  function connectSplitterTree(startPoint, targetPoints, itemColor, totalRate, levelBaseY, itemName) {
+    if (targetPoints.length === 1) {
+      addBelt(belts, itemColor, totalRate, routeHV(startPoint, targetPoints[0]), itemName);
+      return;
+    }
+
+    const factors = findExactFactorChain(targetPoints.length, solution.settings.splitterSizes);
+    if (!factors?.length) {
+      const nodeX = targetPoints.reduce((sum, point) => sum + point.x, 0) / targetPoints.length;
+      const nodeY = levelBaseY;
+      addBelt(belts, itemColor, totalRate, routeHV(startPoint, { x: nodeX, y: nodeY }), itemName);
+      const branchRate = totalRate / targetPoints.length;
+      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\nInput: ${fmt(totalRate)} item/min\nOutputs: ${targetPoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}`);
+      targetPoints.forEach((point) => addBelt(belts, itemColor, branchRate, routeHV({ x: nodeX, y: nodeY }, point), itemName));
+      return;
+    }
+
+    function recurse(sourcePoint, points, factorIndex, y) {
+      if (points.length === 1) {
+        addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(sourcePoint, points[0]), itemName);
+        return;
+      }
+      const factor = factors[factorIndex];
+      const groups = partitionTargets(points, factor);
+      const nodeX = groups.reduce((sum, group) => sum + group.reduce((inner, point) => inner + point.x, 0) / group.length, 0) / groups.length;
+      const nodeY = y;
+      const inboundRate = totalRate * (points.length / targetPoints.length);
+      addBelt(belts, itemColor, inboundRate, routeHV(sourcePoint, { x: nodeX, y: nodeY }), itemName);
+      const nextY = y + 34;
+      const childRate = inboundRate / factor;
+      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\nInput: ${fmt(inboundRate)} item/min\nOutputs: ${groups.map(() => `${fmt(childRate)} item/min`).join(", ")}`);
+      groups.forEach((group) => {
+        const groupPoint = { x: group.reduce((sum, point) => sum + point.x, 0) / group.length, y: nodeY };
+        addBelt(belts, itemColor, childRate * group.length, [{ x: nodeX, y: nodeY }, { x: groupPoint.x, y: groupPoint.y }], itemName);
+        if (factorIndex === factors.length - 1) {
+          group.forEach((point) => addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(groupPoint, point), itemName));
+        } else {
+          recurse(groupPoint, group, factorIndex + 1, nextY);
+        }
+      });
+    }
+
+    recurse(startPoint, targetPoints, 0, levelBaseY);
+  }
+
+  function connectMergerTree(sourcePoints, targetPoint, itemColor, totalRate, levelBaseY, itemName) {
+    if (sourcePoints.length === 1) {
+      addBelt(outputBelts, itemColor, totalRate, routeHV(sourcePoints[0], targetPoint), itemName);
+      return;
+    }
+
+    const factors = findExactFactorChain(sourcePoints.length, solution.settings.mergerSizes)?.slice().reverse();
+    if (!factors?.length) {
+      const nodeX = sourcePoints.reduce((sum, point) => sum + point.x, 0) / sourcePoints.length;
+      const nodeY = levelBaseY;
+      const branchRate = totalRate / sourcePoints.length;
+      sourcePoints.forEach((point) => addBelt(outputBelts, itemColor, branchRate, routeHV(point, { x: nodeX, y: nodeY }), itemName));
+      addRoutingNode(nodeX, nodeY, itemColor, `Merger\nInputs: ${sourcePoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}\nOutput: ${fmt(totalRate)} item/min`);
+      addBelt(outputBelts, itemColor, totalRate, routeHV({ x: nodeX, y: nodeY }, targetPoint), itemName);
+      return;
+    }
+
+    let currentPoints = sourcePoints.slice();
+    let y = levelBaseY;
+    for (let factorIndex = 0; factorIndex < factors.length; factorIndex += 1) {
+      const factor = factors[factorIndex];
+      const groupSize = factor;
+      const groupCount = currentPoints.length / groupSize;
+      const nextPoints = [];
+      for (let index = 0; index < groupCount; index += 1) {
+        const group = currentPoints.slice(index * groupSize, (index + 1) * groupSize);
+        const nodeX = group.reduce((sum, point) => sum + point.x, 0) / group.length;
+        const nodeY = y;
+        const branchRate = totalRate / sourcePoints.length;
+        group.forEach((point) => addBelt(outputBelts, itemColor, branchRate, routeHV(point, { x: nodeX, y: nodeY }), itemName));
+        addRoutingNode(nodeX, nodeY, itemColor, `Merger\nInputs: ${group.map(() => `${fmt(branchRate)} item/min`).join(", ")}\nOutput: ${fmt(branchRate * group.length)} item/min`);
+        nextPoints.push({ x: nodeX, y: nodeY });
+      }
+      currentPoints = nextPoints;
+      y -= 34;
+    }
+    addBelt(outputBelts, itemColor, totalRate, routeHV(currentPoints[0], targetPoint), itemName);
+  }
+
+  function buildNodeVisuals(node) {
+    const pos = positions.get(node);
+    const children = node.children || [];
+    if (node.type === "external") {
+      const itemColor = getNodeItemColor(node, itemMap);
+      const sourceBottomY = pos.y + 34;
+      const sourceTopY = pos.y - 18;
+      addBelt(outputBelts, itemColor, node.rate, [{ x: pos.x, y: sourceBottomY }, { x: pos.x, y: sourceTopY }], node.label);
+      extendBounds(layoutBounds, pos.x - 80, pos.y - 24);
+      extendBounds(layoutBounds, pos.x + 80, pos.y + 70);
+      return { outputX: pos.x, outputY: sourceTopY, itemColor, rate: node.rate };
+    }
+
+    const machineCount = Math.max(1, node.machineCount || 1);
+    const instanceClocks = node.instanceClocks?.length ? node.instanceClocks : [100];
+    const instanceRates = node.instanceRates?.length ? node.instanceRates : [node.actualRate || node.requiredRate || 0];
+    const instanceSpacing = 220;
+    const machineCenters = Array.from({ length: machineCount }, (_, index) => pos.x + (index - (machineCount - 1) / 2) * instanceSpacing);
+    const machineBottomY = pos.y + machineHeight / 2;
+    const inputPortY = machineBottomY + 18;
+    const machineTopY = pos.y - machineHeight / 2;
+    const outputStartY = machineTopY - 18;
+    const outputTipY = outputStartY - 38;
+    const outputItemColor = getNodeItemColor(node, itemMap);
+    const inputColors = children.map((child) => getNodeItemColor(child, itemMap));
+    const machineColor = averageHexColors([...inputColors, outputItemColor]);
+    const machineTextColor = contrastColor(machineColor);
+
+    const splitterY = inputPortY + 46;
+    const mergerY = outputStartY - 28;
+
+    children.forEach((child, index) => {
+      const childVisual = buildNodeVisuals(child);
+      const splitterX = pos.x + (index - (children.length - 1) / 2) * 52;
+
+      if (machineCount === 1) {
+        const targetX = machineCenters[0];
+        addBelt(belts, childVisual.itemColor, childVisual.rate, routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: inputPortY }), child.label);
+      } else {
+        const targetPoints = machineCenters.map((centerX) => ({ x: centerX, y: inputPortY }));
+        connectSplitterTree(
+          { x: childVisual.outputX, y: childVisual.outputY },
+          targetPoints,
+          childVisual.itemColor,
+          childVisual.rate,
+          splitterY + index * 16,
+          child.label
+        );
+      }
+    });
+
+    const outputRate = node.actualRate || node.requiredRate || 0;
+
+    if (machineCount === 1) {
+      addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: outputStartY }, { x: machineCenters[0], y: outputTipY }], node.label);
+    } else {
+      const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: outputStartY }));
+      connectMergerTree(sourcePoints, { x: pos.x, y: outputTipY }, outputItemColor, outputRate, mergerY, node.label);
+    }
+
+    machineCenters.forEach((centerX, machineIndex) => {
+      const instanceRate = instanceRates[machineIndex] || 0;
+      const instanceClock = instanceClocks[machineIndex] || 100;
+      renderedNodes.push(`
+        <g class="factory-machine">
+          <rect x="${centerX - machineWidth / 2}" y="${pos.y - machineHeight / 2}" width="${machineWidth}" height="${machineHeight}" fill="${machineColor}" stroke="rgba(60,48,31,0.85)" stroke-width="2"></rect>
+          <text x="${centerX}" y="${pos.y - 12}" text-anchor="middle" class="factory-machine-label" fill="${machineTextColor}">${escapeHtml(node.machineName)}</text>
+          <text x="${centerX}" y="${pos.y + 8}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${node.label} · ${fmt(instanceRate)} item/min`)}</text>
+          <text x="${centerX}" y="${pos.y + 28}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${fmt(instanceClock)}%`)}</text>
+        </g>
+      `);
+      extendBounds(layoutBounds, centerX - machineWidth / 2, pos.y - machineHeight / 2);
+      extendBounds(layoutBounds, centerX + machineWidth / 2, pos.y + machineHeight / 2);
+    });
+
+    extendBounds(layoutBounds, pos.x - 40, outputTipY - 12);
+    extendBounds(layoutBounds, pos.x + 40, outputTipY);
+
+    return { outputX: pos.x, outputY: outputTipY, itemColor: outputItemColor, rate: outputRate };
+  }
+
+  buildNodeVisuals(solution.targetNode);
+  resolveParallelOverlaps(belts);
+  resolveParallelOverlaps(outputBelts);
+  markOverpasses(belts);
+  markOverpasses(outputBelts);
+  [...belts, ...outputBelts].forEach((belt) => {
+    belt.segments.forEach((segment) => {
+      extendBounds(layoutBounds, segment.x1, segment.y1);
+      extendBounds(layoutBounds, segment.x2, segment.y2);
+    });
+  });
+  const padding = 48;
+  const shiftX = Number.isFinite(layoutBounds.minX) ? Math.max(0, padding - layoutBounds.minX) : 0;
+  const shiftY = Number.isFinite(layoutBounds.minY) ? Math.max(0, padding - layoutBounds.minY) : 0;
+  const contentWidth = Number.isFinite(layoutBounds.maxX) ? layoutBounds.maxX - layoutBounds.minX + padding * 2 : width;
+  const contentHeight = Number.isFinite(layoutBounds.maxY) ? layoutBounds.maxY - layoutBounds.minY + padding * 2 : height;
+  const viewWidth = Math.max(width, contentWidth);
+  const viewHeight = Math.max(height, contentHeight);
+
+  return `
+    <svg viewBox="0 0 ${viewWidth} ${viewHeight}" role="img" aria-label="Factory layout board">
+      <g transform="translate(${shiftX} ${shiftY})">
+        ${[...belts, ...outputBelts].map(renderFactoryBelt).join("")}
+        ${renderedNodes.join("")}
+      </g>
+    </svg>
+  `;
 }
 
 function openRecipeModal(recipeId = "") {
@@ -1239,16 +1945,17 @@ function render() {
   const solution = solveFactory();
   const items = getDefinedItems();
   const machineClasses = getDefinedMachineClasses();
+  const beltSpeedRows = state.settings.beltSpeeds;
+  const beltSpeedStatuses = getBeltSpeedStatuses();
   const roleState = deriveItemRoles();
   const itemStatuses = getItemRowStatuses();
   const machineStatuses = getMachineClassStatuses();
   const duplicateRecipes = solution.duplicateIds;
-  const beltSpeedOptions = getSettingsNumbers().beltSpeeds.map((speed) => String(speed));
+  const beltSpeedOptions = getSettingsNumbers().beltSpeeds.map((entry) => entry.speedText);
   const targetItems = items.filter((item) => !roleState.externalInputIds.has(item.id));
-  const clockMin = getClockSliderValue(state.settings.clockMin || 1);
-  const clockMax = Math.max(clockMin, getClockSliderValue(state.settings.clockMax || 250));
+  const clockMin = getClockSliderValue(state.settings.clockMin || 25);
+  const clockMax = 100;
   const sliderLeft = ((clockMin - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
-  const sliderRight = ((clockMax - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
 
   document.getElementById("app").innerHTML = `
     <div class="top-area">
@@ -1339,7 +2046,25 @@ function render() {
         <section class="panel">
           <h2>Global Settings</h2>
           <div class="settings-grid">
-            <div><label class="field-label">Available belt speeds</label><input type="text" value="${escapeHtml(state.settings.beltSpeeds)}" data-setting="beltSpeeds"></div>
+            <div class="settings-span-2">
+              <label class="field-label">Available belt speeds</label>
+              <div class="belt-speed-config">
+                ${beltSpeedRows.map((row, index) => `
+                  <div class="belt-speed-row ${beltSpeedStatuses.get(row.id)?.valid ? "valid" : ""}">
+                    <input type="text" value="${escapeHtml(row.speed)}" placeholder="Speed" data-belt-speed-field="speed" data-belt-speed-id="${row.id}">
+                    <input type="text" value="${escapeHtml(row.color)}" placeholder="Arrow color" data-belt-speed-field="color" data-belt-speed-id="${row.id}">
+                    <div class="speed-swatch" style="background:${isValidColor(row.color) ? escapeHtml(row.color) : "#555"}"></div>
+                    <div class="footnote">
+                      ${beltSpeedStatuses.get(row.id)?.valid
+                        ? `${escapeHtml(fmt(parseNumber(row.speed) || 0))} item/min`
+                        : index === beltSpeedRows.length - 1
+                          ? "Leave one empty row available for the next belt speed."
+                          : "Provide a unique numeric speed and a valid color."}
+                    </div>
+                  </div>
+                `).join("")}
+              </div>
+            </div>
             <div><label class="field-label">Allowed splitter sizes</label><input type="text" value="${escapeHtml(state.settings.splitterSizes)}" data-setting="splitterSizes"></div>
             <div><label class="field-label">Allowed merger sizes</label><input type="text" value="${escapeHtml(state.settings.mergerSizes)}" data-setting="mergerSizes"></div>
             <div><label class="field-label">Maximum available power</label><input type="text" value="${escapeHtml(state.settings.maxPower)}" data-setting="maxPower"></div>
@@ -1358,20 +2083,19 @@ function render() {
               <div>Enable overflow belts</div>
               <div><input type="checkbox" data-setting-check="enableOverflow" ${state.settings.enableOverflow ? "checked" : ""}></div>
             </div>
-            <div class="clock-panel">
+            <div class="clock-panel settings-span-2">
               <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
-                <strong>Clock speed interval</strong>
-                <span class="pill">${fmt(getSettingsNumbers().minClock)}% to ${fmt(getSettingsNumbers().maxClock)}%</span>
+                <strong>Minimum remainder clock</strong>
+                <span class="pill">${fmt(getSettingsNumbers().minClock)}% to 100%</span>
               </div>
               <div class="dual-slider">
                 <div class="dual-slider-track"></div>
-                <div class="dual-slider-fill" style="left:${sliderLeft}%;right:${100 - sliderRight}%"></div>
+                <div class="dual-slider-fill" style="left:${sliderLeft}%;right:0%"></div>
                 <input type="range" min="${CLOCK_SLIDER_MIN}" max="${CLOCK_SLIDER_MAX}" step="${CLOCK_STEP}" value="${escapeHtml(String(clockMin))}" data-clock-slider="min">
-                <input type="range" min="${CLOCK_SLIDER_MIN}" max="${CLOCK_SLIDER_MAX}" step="${CLOCK_STEP}" value="${escapeHtml(String(clockMax))}" data-clock-slider="max">
               </div>
               <div class="clock-values">
-                <div><label class="field-label">Minimum allowed clock</label><input type="text" value="${escapeHtml(state.settings.clockMin)}" data-setting="clockMin"></div>
-                <div><label class="field-label">Maximum allowed clock</label><input type="text" value="${escapeHtml(state.settings.clockMax)}" data-setting="clockMax"></div>
+                <div><label class="field-label">Minimum allowed remainder clock</label><input type="text" value="${escapeHtml(state.settings.clockMin)}" data-setting="clockMin"></div>
+                <div class="mini-summary"><strong>Maximum clock</strong><br>100%</div>
               </div>
             </div>
           </div>
@@ -1493,14 +2217,14 @@ function render() {
       </div>
     </div>
 
-    <section class="board-shell">
-      <div class="board-header">
-        <div>
-          <strong>Solver Board</strong>
-          <div class="footnote">Automatically derived dependency chain for the current target output.</div>
+      <section class="board-shell">
+        <div class="board-header">
+          <div>
+          <strong>Factory Layout</strong>
+          <div class="footnote">Automatically derived geometric belt plan for the current target output.</div>
+          </div>
         </div>
-      </div>
-      <div class="board-stage">${renderSolverBoard(solution)}</div>
+        <div class="board-stage">${renderSolverBoard(solution)}</div>
     </section>
   `;
 
@@ -1510,12 +2234,10 @@ function render() {
 }
 
 function commitSettings(normalizeStrings = true) {
-  const min = Math.max(CLOCK_SLIDER_MIN, parseNumber(state.settings.clockMin) ?? 1);
-  const max = Math.max(min, parseNumber(state.settings.clockMax) ?? 250);
+  const min = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(state.settings.clockMin) ?? 25, 100));
   state.settings.clockMin = normalizeStrings ? normalizeNumericString(String(min), 2) : String(min);
-  state.settings.clockMax = normalizeStrings ? normalizeNumericString(String(Math.min(max, CLOCK_SLIDER_MAX)), 2) : String(Math.min(max, CLOCK_SLIDER_MAX));
+  state.settings.clockMax = "100";
   if (normalizeStrings) {
-    state.settings.beltSpeeds = formatListNumbers(parseListNumbers(state.settings.beltSpeeds, false));
     state.settings.splitterSizes = formatListNumbers(parseListNumbers(state.settings.splitterSizes, true));
     state.settings.mergerSizes = formatListNumbers(parseListNumbers(state.settings.mergerSizes, true));
     const maxPower = parseNumber(state.settings.maxPower);
@@ -1527,19 +2249,14 @@ function commitSettings(normalizeStrings = true) {
 
 function syncClockSliderUi(container = document) {
   const minSlider = container.querySelector('[data-clock-slider="min"]');
-  const maxSlider = container.querySelector('[data-clock-slider="max"]');
   const minInput = container.querySelector('[data-setting="clockMin"]');
-  const maxInput = container.querySelector('[data-setting="clockMax"]');
   const fill = container.querySelector(".dual-slider-fill");
-  if (!minSlider || !maxSlider || !minInput || !maxInput || !fill) return;
+  if (!minSlider || !minInput || !fill) return;
   const minValue = getClockSliderValue(state.settings.clockMin);
-  const maxValue = Math.max(minValue, getClockSliderValue(state.settings.clockMax));
   minSlider.value = String(minValue);
-  maxSlider.value = String(maxValue);
   const left = ((minValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
-  const right = ((maxValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
   fill.style.left = `${left}%`;
-  fill.style.right = `${100 - right}%`;
+  fill.style.right = "0%";
 }
 
 function attachEvents() {
@@ -1617,6 +2334,27 @@ function attachEvents() {
     button.onclick = () => openRecipeModal(button.dataset.editRecipe);
   });
 
+  app.querySelectorAll("[data-belt-speed-field]").forEach((input) => {
+    input.oninput = (event) => {
+      const row = state.settings.beltSpeeds.find((entry) => entry.id === input.dataset.beltSpeedId);
+      if (!row) return;
+      row[input.dataset.beltSpeedField] = event.target.value;
+    };
+    input.onblur = () => {
+      const row = state.settings.beltSpeeds.find((entry) => entry.id === input.dataset.beltSpeedId);
+      if (!row) return;
+      if (input.dataset.beltSpeedField === "speed") row.speed = normalizeNumericString(row.speed, 6);
+      ensureStateStructure();
+      render();
+    };
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+      }
+    };
+  });
+
   app.querySelectorAll("[data-action='add-recipe']").forEach((button) => {
     button.onclick = () => openRecipeModal();
   });
@@ -1656,15 +2394,11 @@ function attachEvents() {
     };
     input.oninput = (event) => {
       const value = getClockSliderValue(event.target.value);
-      const currentMin = getClockSliderValue(state.settings.clockMin);
-      const currentMax = getClockSliderValue(state.settings.clockMax);
-      if (event.target.dataset.clockSlider === "min") state.settings.clockMin = String(Math.min(value, currentMax));
-      else state.settings.clockMax = String(Math.max(value, currentMin));
+      state.settings.clockMin = String(Math.min(value, 100));
+      state.settings.clockMax = "100";
       syncClockSliderUi(app);
       const minInput = app.querySelector('[data-setting="clockMin"]');
-      const maxInput = app.querySelector('[data-setting="clockMax"]');
       if (minInput) minInput.value = String(getClockSliderValue(state.settings.clockMin));
-      if (maxInput) maxInput.value = String(getClockSliderValue(state.settings.clockMax));
     };
     input.onpointerup = () => render();
     input.onpointercancel = () => render();
@@ -1718,4 +2452,5 @@ function attachEvents() {
 }
 
 bindGlobalEvents();
+bindFactoryTooltipEvents();
 render();
