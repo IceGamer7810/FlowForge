@@ -170,12 +170,43 @@ button.secondary:hover { background: #383838; }
   align-items: center;
   justify-content: center;
 }
+.drag-ready {
+  will-change: transform;
+}
+.drag-lift {
+  position: fixed !important;
+  z-index: 3000 !important;
+  pointer-events: none !important;
+  transform: scale(1.06);
+  box-shadow: 0 18px 38px rgba(0, 0, 0, 0.34);
+}
+.drag-placeholder {
+  border-radius: 12px;
+  border: 1px dashed rgba(247, 242, 223, 0.4);
+  background: rgba(255, 255, 255, 0.05);
+}
 
 .item-card-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
   gap: 10px;
   margin-top: 12px;
+}
+
+.recipe-card-list {
+  display: grid;
+  gap: 10px;
+}
+
+.recipe-card-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.recipe-card-duplicate {
+  border-color: #f0ca55;
+  box-shadow: inset 0 0 0 1px rgba(240, 202, 85, 0.55);
 }
 
 .item-card {
@@ -421,6 +452,9 @@ svg { width: 100%; display: block; min-height: 430px; }
 .graph-node .accent { stroke: none; rx: 12; ry: 12; }
 .graph-label { fill: #2f2418; font-size: 14px; font-weight: 700; }
 .graph-sub { fill: #534632; font-size: 11px; }
+.graph-node-merge {
+  cursor: grab;
+}
 .edge-label {
   font-size: 11px;
   font-weight: 700;
@@ -435,6 +469,21 @@ svg { width: 100%; display: block; min-height: 430px; }
 .merge-group .edge-main, .merge-group .edge-outline { transition: 0.15s ease; }
 .merge-group:hover .edge-main { stroke: #ff4d4d !important; stroke-width: 4.5 !important; }
 .merge-group:hover .edge-outline { stroke: rgba(255, 255, 255, 0.95) !important; stroke-width: 8 !important; }
+.merge-block {
+  transition: transform 160ms ease;
+  transform-box: fill-box;
+}
+.merge-block-dragging {
+  transition: none !important;
+}
+.merge-block-body {
+  fill: rgba(106, 91, 60, 0.08);
+  stroke: rgba(106, 91, 60, 0.32);
+  stroke-dasharray: 8 5;
+  rx: 16;
+  ry: 16;
+  cursor: grab;
+}
 
 .machine-box rect {
   fill: rgba(84, 65, 34, 0.14);
@@ -452,6 +501,13 @@ svg { width: 100%; display: block; min-height: 430px; }
   inset: 0;
   pointer-events: none;
   z-index: 9999;
+}
+
+#recipe-modal-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9998;
 }
 
 .color-picker-backdrop {
@@ -585,6 +641,86 @@ svg { width: 100%; display: block; min-height: 430px; }
   gap: 8px;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.42);
+  pointer-events: auto;
+}
+
+.modal-popup {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: min(760px, calc(100vw - 28px));
+  max-height: calc(100vh - 30px);
+  overflow: auto;
+  padding: 16px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, #313131, #252525);
+  border: 1px solid #5b5b5b;
+  box-shadow: 0 24px 54px rgba(0, 0, 0, 0.42);
+  pointer-events: auto;
+  display: grid;
+  gap: 14px;
+}
+
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.modal-section {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.modal-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.modal-row {
+  display: grid;
+  grid-template-columns: 1.3fr 0.8fr auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.modal-two-col {
+  grid-template-columns: 1fr 1fr;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.modal-done-ready {
+  background: #2f693c;
+  border-color: #4b9b5e;
+}
+
+.modal-done-ready:hover {
+  background: #367946;
+  border-color: #65ba79;
+}
+
+.modal-done-disabled {
+  background: #444;
+  border-color: #666;
+  color: #bbb;
+  cursor: not-allowed;
+}
+
 @media (max-width: 1220px) {
   .control-grid, .summary-strip { grid-template-columns: 1fr; }
   .recipe-zones, .recipe-meta { grid-template-columns: 1fr; }
@@ -594,4 +730,5 @@ svg { width: 100%; display: block; min-height: 430px; }
   .app { width: min(100%, calc(100% - 18px)); }
   .recipes-grid { grid-template-columns: 1fr; }
   .process-row, .row.cols-3, .row.cols-4, .clock-values { grid-template-columns: 1fr; }
+  .modal-row, .modal-two-col { grid-template-columns: 1fr; }
 }

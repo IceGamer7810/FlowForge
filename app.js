@@ -1,14 +1,14 @@
-const STORAGE_KEY = "flowforge-state-v1";
+const STORAGE_KEY = "flowforge-state-v2";
 const CLOCK_SLIDER_MIN = 0.01;
 const CLOCK_SLIDER_MAX = 250;
 const CLOCK_STEP = 1;
-const MAX_NETWORK_DEPTH = 4;
-const HARD_NETWORK_DEPTH = 5;
 
 const uid = (() => {
   let i = 1;
   return (prefix) => `${prefix}-${i++}`;
 })();
+
+const colorContextCanvas = document.createElement("canvas").getContext("2d");
 
 function emptyBeltRow() {
   return { id: uid("belt"), value: "" };
@@ -18,39 +18,40 @@ function emptyItemRow() {
   return { id: uid("item"), name: "", color: "", belts: [emptyBeltRow()] };
 }
 
-function emptyIoRow(kind) {
-  return { id: uid(kind), itemId: "", qty: "" };
+function emptyMachineClassRow() {
+  return { id: uid("machine"), name: "", power: "" };
+}
+
+function emptyRecipeInputRow() {
+  return { id: uid("rin"), itemId: "", qty: "" };
 }
 
 function emptyRecipe() {
   return {
     id: uid("recipe"),
-    name: "",
-    inputs: [emptyIoRow("rin")],
-    outputs: [emptyIoRow("rout")],
-    outputRate: "",
-    craftTime: "",
-    power: "",
-    syncSource: "rate"
+    inputs: [emptyRecipeInputRow()],
+    outputItemId: "",
+    outputQty: "",
+    machineClassId: "",
+    itemsPerMinute: ""
   };
-}
-
-function emptyProcessRow() {
-  return { id: uid("proc"), inputItemId: "", outputItemId: "" };
 }
 
 function createDefaultState() {
   return {
     itemRows: [emptyItemRow()],
-    recipes: [emptyRecipe()],
-    processRows: [emptyProcessRow()],
+    machineClassRows: [emptyMachineClassRow()],
+    recipes: [],
     settings: {
       beltSpeeds: "60, 120, 270, 480, 780",
       splitterSizes: "2, 3",
       mergerSizes: "2, 3",
       maxPower: "1000",
       clockMin: "1",
-      clockMax: "250"
+      clockMax: "250",
+      enableOverflow: true,
+      targetOutputItemId: "",
+      targetOutputRate: "60"
     }
   };
 }
@@ -59,8 +60,8 @@ function sanitizeState(input) {
   const base = createDefaultState();
   const next = {
     itemRows: Array.isArray(input.itemRows) ? input.itemRows : base.itemRows,
+    machineClassRows: Array.isArray(input.machineClassRows) ? input.machineClassRows : base.machineClassRows,
     recipes: Array.isArray(input.recipes) ? input.recipes : base.recipes,
-    processRows: Array.isArray(input.processRows) ? input.processRows : base.processRows,
     settings: { ...base.settings, ...(input.settings || {}) }
   };
 
@@ -73,29 +74,24 @@ function sanitizeState(input) {
       : [emptyBeltRow()]
   }));
 
+  next.machineClassRows = next.machineClassRows.map((row) => ({
+    id: row.id || uid("machine"),
+    name: String(row.name || ""),
+    power: String(row.power ?? "")
+  }));
+
   next.recipes = next.recipes.map((recipe) => ({
     id: recipe.id || uid("recipe"),
-    name: String(recipe.name || ""),
     inputs: Array.isArray(recipe.inputs) && recipe.inputs.length
       ? recipe.inputs.map((row) => ({ id: row.id || uid("rin"), itemId: String(row.itemId || ""), qty: String(row.qty ?? "") }))
-      : [emptyIoRow("rin")],
-    outputs: Array.isArray(recipe.outputs) && recipe.outputs.length
-      ? recipe.outputs.map((row) => ({ id: row.id || uid("rout"), itemId: String(row.itemId || ""), qty: String(row.qty ?? "") }))
-      : [emptyIoRow("rout")],
-    outputRate: String(recipe.outputRate ?? ""),
-    craftTime: String(recipe.craftTime ?? ""),
-    power: String(recipe.power ?? ""),
-    syncSource: recipe.syncSource === "time" ? "time" : "rate"
+      : [emptyRecipeInputRow()],
+    outputItemId: String(recipe.outputItemId || ""),
+    outputQty: String(recipe.outputQty ?? ""),
+    machineClassId: String(recipe.machineClassId || ""),
+    itemsPerMinute: String(recipe.itemsPerMinute ?? "")
   }));
 
-  next.processRows = next.processRows.map((row) => ({
-    id: row.id || uid("proc"),
-    inputItemId: String(row.inputItemId || ""),
-    outputItemId: String(row.outputItemId || "")
-  }));
-
-  ensureTrailingStructures(next);
-  sanitizeReferences(next);
+  ensureStateStructure(next);
   return next;
 }
 
@@ -109,6 +105,7 @@ function loadState() {
 }
 
 let state = loadState();
+
 let colorPickerState = {
   open: false,
   targetItemId: "",
@@ -118,7 +115,15 @@ let colorPickerState = {
   val: 100,
   draftHex: "#ff0000"
 };
-let colorPickerGlobalEventsBound = false;
+
+let recipeModalState = {
+  open: false,
+  recipeId: "",
+  draft: emptyRecipe(),
+  mode: "create"
+};
+
+let globalEventsBound = false;
 
 function saveLocal() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -147,10 +152,63 @@ function fmt(num, digits = 2) {
   return Number(num.toFixed(digits)).toString();
 }
 
+function formatListNumbers(values) {
+  return values.map((value) => String(value)).join(", ");
+}
+
+function parseListNumbers(text, integerOnly = false) {
+  return String(text || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => integerOnly ? Math.trunc(Number(part)) : Number(part))
+    .filter((num) => Number.isFinite(num) && num > 0)
+    .filter((num, index, array) => array.indexOf(num) === index)
+    .sort((a, b) => a - b);
+}
+
 function getClockSliderValue(value) {
   const parsed = parseNumber(String(value));
   if (parsed === null) return Math.round(CLOCK_SLIDER_MIN);
   return Math.max(Math.round(CLOCK_SLIDER_MIN), Math.min(Math.round(parsed), Math.round(CLOCK_SLIDER_MAX)));
+}
+
+function getSettingsNumbers(targetState = state) {
+  const beltSpeeds = parseListNumbers(targetState.settings.beltSpeeds, false);
+  const splitterSizes = parseListNumbers(targetState.settings.splitterSizes, true);
+  const mergerSizes = parseListNumbers(targetState.settings.mergerSizes, true);
+  const maxPower = parseNumber(targetState.settings.maxPower) ?? 0;
+  const minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(targetState.settings.clockMin) ?? 1, CLOCK_SLIDER_MAX));
+  const maxClock = Math.max(minClock, Math.min(parseNumber(targetState.settings.clockMax) ?? 250, CLOCK_SLIDER_MAX));
+  const enableOverflow = Boolean(targetState.settings.enableOverflow);
+  const targetOutputRate = parseNumber(targetState.settings.targetOutputRate) ?? 0;
+  return {
+    beltSpeeds,
+    splitterSizes,
+    mergerSizes,
+    maxPower,
+    minClock,
+    maxClock,
+    enableOverflow,
+    targetOutputItemId: targetState.settings.targetOutputItemId || "",
+    targetOutputRate
+  };
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function isValidColor(value) {
+  if (!value.trim()) return false;
+  const probe = new Option().style;
+  probe.color = "";
+  probe.color = value.trim();
+  return probe.color !== "";
 }
 
 function randomVisibleColor() {
@@ -160,16 +218,10 @@ function randomVisibleColor() {
   return `hsl(${h} ${s}% ${l}%)`;
 }
 
-function colorContext() {
-  if (!colorContext.ctx) colorContext.ctx = document.createElement("canvas").getContext("2d");
-  return colorContext.ctx;
-}
-
 function parseCssColorToHex(value) {
-  const ctx = colorContext();
-  ctx.fillStyle = "#000000";
-  ctx.fillStyle = value;
-  const normalized = ctx.fillStyle;
+  colorContextCanvas.fillStyle = "#000000";
+  colorContextCanvas.fillStyle = value;
+  const normalized = colorContextCanvas.fillStyle;
   if (/^#[0-9a-f]{6}$/i.test(normalized)) return normalized.toLowerCase();
   const match = normalized.match(/^rgb\((\d+),\s*(\d+),\s*(\d+)\)$/i);
   if (!match) return "#ff0000";
@@ -274,23 +326,19 @@ function applyColorPicker() {
   row[colorPickerState.targetField] = colorPickerState.draftHex;
   colorPickerState.open = false;
   colorPickerState.targetItemId = "";
+  ensureStateStructure();
   render();
 }
 
-function bindColorPickerGlobalEvents() {
-  if (colorPickerGlobalEventsBound) return;
+function bindGlobalEvents() {
+  if (globalEventsBound) return;
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && colorPickerState.open) closeColorPicker();
+    if (event.key === "Escape") {
+      if (colorPickerState.open) closeColorPicker();
+      if (recipeModalState.open) closeRecipeModal();
+    }
   });
-  colorPickerGlobalEventsBound = true;
-}
-
-function isValidColor(value) {
-  if (!value.trim()) return false;
-  const probe = new Option().style;
-  probe.color = "";
-  probe.color = value.trim();
-  return probe.color !== "";
+  globalEventsBound = true;
 }
 
 function isItemRowEmpty(row) {
@@ -313,832 +361,548 @@ function getItemRowStatuses(targetState = state) {
   targetState.itemRows.forEach((row) => {
     const nameKey = row.name.trim().toLowerCase();
     const colorKey = row.color.trim().toLowerCase();
-    const valid = Boolean(
-      nameKey &&
-      isValidColor(row.color) &&
-      nameCounts.get(nameKey) === 1 &&
-      colorKey &&
-      colorCounts.get(colorKey) === 1
-    );
     statuses.set(row.id, {
       empty: isItemRowEmpty(row),
-      valid
+      valid: Boolean(nameKey && colorKey && isValidColor(row.color) && nameCounts.get(nameKey) === 1 && colorCounts.get(colorKey) === 1)
     });
   });
-
   return statuses;
-}
-
-function isValidItemRow(row, targetState = state) {
-  return getItemRowStatuses(targetState).get(row.id)?.valid || false;
 }
 
 function ensureItemRows(targetState = state) {
   const meaningfulRows = targetState.itemRows.filter((row) => !isItemRowEmpty(row));
-  targetState.itemRows = meaningfulRows.length ? [...meaningfulRows] : [];
-
-  const statuses = getItemRowStatuses(targetState);
-  const trimmedRows = [];
-
-  for (const row of targetState.itemRows) {
-    trimmedRows.push(row);
+  const statuses = getItemRowStatuses({ ...targetState, itemRows: meaningfulRows });
+  const trimmed = [];
+  for (const row of meaningfulRows) {
+    trimmed.push(row);
     if (!statuses.get(row.id)?.valid) break;
   }
-
-  targetState.itemRows = trimmedRows;
-
-  const allMeaningfulValid = targetState.itemRows.length > 0 &&
-    targetState.itemRows.every((row) => statuses.get(row.id)?.valid);
-
-  if (allMeaningfulValid || targetState.itemRows.length === 0) {
-    targetState.itemRows.push(emptyItemRow());
-  }
-
-  if (!targetState.itemRows.length) {
-    targetState.itemRows.push(emptyItemRow());
-  }
+  targetState.itemRows = trimmed;
+  const recalculated = getItemRowStatuses(targetState);
+  const allValid = targetState.itemRows.length > 0 && targetState.itemRows.every((row) => recalculated.get(row.id)?.valid);
+  if (!targetState.itemRows.length || allValid) targetState.itemRows.push(emptyItemRow());
 }
 
-function isValidProcessRow(row) {
-  return row.inputItemId && row.outputItemId;
+function getMachineClassStatuses(targetState = state) {
+  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim());
+  const nameCounts = new Map();
+  meaningfulRows.forEach((row) => {
+    const key = row.name.trim().toLowerCase();
+    if (key) nameCounts.set(key, (nameCounts.get(key) || 0) + 1);
+  });
+
+  const statuses = new Map();
+  targetState.machineClassRows.forEach((row) => {
+    const key = row.name.trim().toLowerCase();
+    const power = parseNumber(row.power);
+    statuses.set(row.id, {
+      empty: !row.name.trim() && !row.power.trim(),
+      valid: Boolean(key && nameCounts.get(key) === 1 && power !== null && power > 0)
+    });
+  });
+  return statuses;
 }
 
-function ensureTrailingBelts(itemRow) {
-  const nonEmpty = itemRow.belts.filter((belt) => belt.value !== "");
-  itemRow.belts = [...nonEmpty, emptyBeltRow()];
+function ensureMachineClassRows(targetState = state) {
+  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim());
+  const statuses = getMachineClassStatuses({ ...targetState, machineClassRows: meaningfulRows });
+  const trimmed = [];
+  for (const row of meaningfulRows) {
+    trimmed.push(row);
+    if (!statuses.get(row.id)?.valid) break;
+  }
+  targetState.machineClassRows = trimmed;
+  const recalculated = getMachineClassStatuses(targetState);
+  const allValid = targetState.machineClassRows.length > 0 && targetState.machineClassRows.every((row) => recalculated.get(row.id)?.valid);
+  if (!targetState.machineClassRows.length || allValid) targetState.machineClassRows.push(emptyMachineClassRow());
 }
 
 function sanitizeBeltSelections(targetState = state) {
   const validBeltValues = new Set(parseListNumbers(targetState.settings.beltSpeeds, false).map((value) => String(value)));
   targetState.itemRows.forEach((row) => {
     row.belts.forEach((belt) => {
-      if (belt.value !== "" && !validBeltValues.has(String(belt.value))) {
-        belt.value = "";
-      }
+      if (belt.value !== "" && !validBeltValues.has(String(belt.value))) belt.value = "";
     });
   });
 }
 
-function ensureTrailingIoRows(list, kind) {
-  const nonEmpty = list.filter((row) => row.itemId || row.qty !== "");
-  list.length = 0;
-  nonEmpty.forEach((row) => list.push(row));
-  list.push(emptyIoRow(kind));
+function ensureTrailingBelts(itemRow) {
+  const nonEmpty = itemRow.belts.filter((belt) => belt.value !== "");
+  itemRow.belts = nonEmpty.length ? [...nonEmpty, emptyBeltRow()] : [emptyBeltRow()];
 }
 
-function ensureTrailingStructures(targetState = state) {
+function ensureStateStructure(targetState = state) {
   ensureItemRows(targetState);
+  ensureMachineClassRows(targetState);
   sanitizeBeltSelections(targetState);
   targetState.itemRows.forEach((row) => ensureTrailingBelts(row));
-
-  if (!targetState.recipes.length) targetState.recipes.push(emptyRecipe());
-  targetState.recipes.forEach((recipe) => {
-    ensureTrailingIoRows(recipe.inputs, "rin");
-    ensureTrailingIoRows(recipe.outputs, "rout");
-  });
-
-  if (!targetState.processRows.length) targetState.processRows.push(emptyProcessRow());
-  if (isValidProcessRow(targetState.processRows[targetState.processRows.length - 1])) targetState.processRows.push(emptyProcessRow());
+  targetState.recipes = targetState.recipes.map((recipe) => sanitizeRecipe(recipe));
 }
 
 function getDefinedItems(targetState = state) {
-  const itemStatuses = getItemRowStatuses(targetState);
+  const statuses = getItemRowStatuses(targetState);
   return targetState.itemRows
-    .filter((row) => itemStatuses.get(row.id)?.valid)
-    .map((row) => ({
-      id: row.id,
-      name: row.name.trim(),
-      color: row.color.trim(),
-      belts: row.belts
-    }));
+    .filter((row) => statuses.get(row.id)?.valid)
+    .map((row) => ({ id: row.id, name: row.name.trim(), color: row.color.trim(), belts: row.belts }));
 }
 
 function getItemMap(targetState = state) {
   return new Map(getDefinedItems(targetState).map((item) => [item.id, item]));
 }
 
-function sanitizeReferences(targetState = state) {
-  const validIds = new Set(getDefinedItems(targetState).map((item) => item.id));
+function getDefinedMachineClasses(targetState = state) {
+  const statuses = getMachineClassStatuses(targetState);
+  return targetState.machineClassRows
+    .filter((row) => statuses.get(row.id)?.valid)
+    .map((row) => ({ id: row.id, name: row.name.trim(), power: parseNumber(row.power) || 0 }));
+}
+
+function getMachineClassMap(targetState = state) {
+  return new Map(getDefinedMachineClasses(targetState).map((row) => [row.id, row]));
+}
+
+function hasRealBeltInput(itemRow) {
+  return itemRow.belts.some((belt) => belt.value !== "");
+}
+
+function sanitizeRecipe(recipe) {
+  const next = {
+    id: recipe.id || uid("recipe"),
+    inputs: Array.isArray(recipe.inputs) ? recipe.inputs.map((row) => ({ id: row.id || uid("rin"), itemId: String(row.itemId || ""), qty: String(row.qty ?? "") })) : [emptyRecipeInputRow()],
+    outputItemId: String(recipe.outputItemId || ""),
+    outputQty: String(recipe.outputQty ?? ""),
+    machineClassId: String(recipe.machineClassId || ""),
+    itemsPerMinute: String(recipe.itemsPerMinute ?? "")
+  };
+  const filledInputs = next.inputs.filter((row) => row.itemId || row.qty !== "");
+  next.inputs = filledInputs.length ? filledInputs : [];
+  return next;
+}
+
+function createRecipeDraft(recipe = emptyRecipe()) {
+  const next = sanitizeRecipe(recipe);
+  const filledInputs = next.inputs.filter((row) => row.itemId || row.qty !== "");
+  next.inputs = filledInputs.length ? filledInputs : [emptyRecipeInputRow()];
+  ensureDraftInputRows(next);
+  return next;
+}
+
+function isDraftInputRowValid(row) {
+  const qty = parseNumber(row.qty);
+  return Boolean(row.itemId && qty !== null && qty > 0);
+}
+
+function ensureDraftInputRows(draft) {
+  const meaningful = draft.inputs.filter((row) => row.itemId || row.qty !== "");
+  if (!meaningful.length) {
+    draft.inputs = [emptyRecipeInputRow()];
+    return;
+  }
+  draft.inputs = meaningful;
+  if (isDraftInputRowValid(meaningful[meaningful.length - 1])) draft.inputs.push(emptyRecipeInputRow());
+}
+
+function getDraftDuplicateInputIds(draft) {
+  const counts = new Map();
+  draft.inputs.forEach((row) => {
+    if (!row.itemId) return;
+    counts.set(row.itemId, (counts.get(row.itemId) || 0) + 1);
+  });
+  return new Set([...counts.entries()].filter(([, count]) => count > 1).map(([itemId]) => itemId));
+}
+
+function getRecipeValidation(draft, targetState = state) {
+  const itemMap = getItemMap(targetState);
+  const machineMap = getMachineClassMap(targetState);
+  const duplicateInputIds = getDraftDuplicateInputIds(draft);
+  const validInputs = draft.inputs
+    .map((row) => ({ ...row, qtyNum: parseNumber(row.qty) }))
+    .filter((row) => row.itemId && itemMap.has(row.itemId) && row.qtyNum !== null && row.qtyNum > 0);
+  const outputQty = parseNumber(draft.outputQty);
+  const itemsPerMinute = parseNumber(draft.itemsPerMinute);
+  const valid =
+    validInputs.length > 0 &&
+    duplicateInputIds.size === 0 &&
+    draft.outputItemId &&
+    itemMap.has(draft.outputItemId) &&
+    outputQty !== null &&
+    outputQty > 0 &&
+    draft.machineClassId &&
+    machineMap.has(draft.machineClassId) &&
+    itemsPerMinute !== null &&
+    itemsPerMinute > 0;
+  return { valid, validInputs, duplicateInputIds };
+}
+
+function recipeSignature(recipe) {
+  const inputs = recipe.inputs
+    .map((row) => ({ itemId: row.itemId, qty: normalizeNumericString(row.qty, 6) }))
+    .filter((row) => row.itemId && row.qty)
+    .sort((a, b) => a.itemId.localeCompare(b.itemId));
+  return JSON.stringify({
+    inputs,
+    outputItemId: recipe.outputItemId,
+    outputQty: normalizeNumericString(recipe.outputQty, 6),
+    machineClassId: recipe.machineClassId,
+    itemsPerMinute: normalizeNumericString(recipe.itemsPerMinute, 6)
+  });
+}
+
+function getDuplicateRecipeGroups(targetState = state) {
+  const groups = new Map();
   targetState.recipes.forEach((recipe) => {
-    recipe.inputs.forEach((row) => { if (row.itemId && !validIds.has(row.itemId)) row.itemId = ""; });
-    recipe.outputs.forEach((row) => { if (row.itemId && !validIds.has(row.itemId)) row.itemId = ""; });
+    const signature = recipeSignature(recipe);
+    if (!groups.has(signature)) groups.set(signature, []);
+    groups.get(signature).push(recipe.id);
   });
-  targetState.processRows.forEach((row) => {
-    if (row.inputItemId && !validIds.has(row.inputItemId)) row.inputItemId = "";
-    if (row.outputItemId && !validIds.has(row.outputItemId)) row.outputItemId = "";
-  });
+  return new Map([...groups.entries()].filter(([, ids]) => ids.length > 1));
 }
 
-function parseListNumbers(text, integerOnly = false) {
-  return String(text || "")
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => integerOnly ? Math.trunc(Number(part)) : Number(part))
-    .filter((num) => Number.isFinite(num) && num > 0)
-    .filter((num, index, array) => array.indexOf(num) === index)
-    .sort((a, b) => a - b);
-}
-
-function formatListNumbers(values) {
-  return values.map((value) => String(value)).join(", ");
-}
-
-function getSettingsNumbers() {
-  const beltSpeeds = parseListNumbers(state.settings.beltSpeeds, false);
-  const splitterSizes = parseListNumbers(state.settings.splitterSizes, true);
-  const mergerSizes = parseListNumbers(state.settings.mergerSizes, true);
-  const maxPower = parseNumber(state.settings.maxPower) ?? 0;
-  let minClock = parseNumber(state.settings.clockMin) ?? 1;
-  let maxClock = parseNumber(state.settings.clockMax) ?? 250;
-  minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(minClock, CLOCK_SLIDER_MAX));
-  maxClock = Math.max(minClock, Math.min(maxClock, CLOCK_SLIDER_MAX));
-  return { beltSpeeds, splitterSizes, mergerSizes, maxPower, minClock, maxClock };
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-function contrastColor(color) {
-  const temp = document.createElement("canvas").getContext("2d");
-  temp.fillStyle = color;
-  const normalized = temp.fillStyle;
-  const match = normalized.match(/^#([0-9a-f]{6})$/i);
-  if (!match) return "#111";
-  const value = match[1];
-  const r = parseInt(value.slice(0, 2), 16);
-  const g = parseInt(value.slice(2, 4), 16);
-  const b = parseInt(value.slice(4, 6), 16);
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-  return luminance > 0.6 ? "#111" : "#fff";
-}
-
-function findDuplicateItemNames(items) {
-  const seen = new Map();
-  const duplicates = [];
-  items.forEach((item) => {
-    const key = item.name.trim().toLowerCase();
-    if (!key) return;
-    if (seen.has(key) && !duplicates.includes(item.name.trim())) duplicates.push(item.name.trim());
-    seen.set(key, item.id);
-  });
-  return duplicates;
+function buildRecipeCatalog(targetState = state) {
+  const duplicates = getDuplicateRecipeGroups(targetState);
+  const duplicateIds = new Set([...duplicates.values()].flat());
+  const firstIds = new Set([...duplicates.values()].map((ids) => ids[0]));
+  const uniqueRecipes = targetState.recipes.filter((recipe) => !duplicateIds.has(recipe.id) || firstIds.has(recipe.id));
+  return { duplicates, duplicateIds, uniqueRecipes };
 }
 
 function deriveItemRoles(targetState = state) {
   const items = getDefinedItems(targetState);
   const itemMap = new Map(items.map((item) => [item.id, item]));
   const externalInputIds = new Set();
+  const externalRates = new Map();
+  items.forEach((item) => {
+    const total = item.belts.map((belt) => parseNumber(belt.value)).filter((value) => value !== null && value > 0).reduce((sum, value) => sum + value, 0);
+    if (total > 0) {
+      externalInputIds.add(item.id);
+      externalRates.set(item.id, total);
+    }
+  });
+
   const producedIds = new Set();
-  const recipeInputReferencedIds = new Set();
-  const recipeOutputReferencedIds = new Set();
-  const processInputReferencedIds = new Set();
-  const processOutputReferencedIds = new Set();
-  const referencedIds = new Set();
-
-  items.forEach((item) => {
-    const totalBelt = item.belts
-      .map((belt) => parseNumber(belt.value))
-      .filter((num) => num !== null && num > 0)
-      .reduce((sum, num) => sum + num, 0);
-    if (totalBelt > 0) externalInputIds.add(item.id);
-  });
-
   targetState.recipes.forEach((recipe) => {
-    recipe.inputs.forEach((row) => {
-      if (!row.itemId || !itemMap.has(row.itemId)) return;
-      recipeInputReferencedIds.add(row.itemId);
-      referencedIds.add(row.itemId);
-    });
-    recipe.outputs.forEach((row) => {
-      if (!row.itemId || !itemMap.has(row.itemId)) return;
-      recipeOutputReferencedIds.add(row.itemId);
-      producedIds.add(row.itemId);
-      referencedIds.add(row.itemId);
-    });
+    if (recipe.outputItemId && itemMap.has(recipe.outputItemId)) producedIds.add(recipe.outputItemId);
   });
 
-  targetState.processRows.forEach((row) => {
-    if (row.inputItemId && itemMap.has(row.inputItemId)) {
-      processInputReferencedIds.add(row.inputItemId);
-      referencedIds.add(row.inputItemId);
-    }
-    if (row.outputItemId && itemMap.has(row.outputItemId)) {
-      processOutputReferencedIds.add(row.outputItemId);
-      referencedIds.add(row.outputItemId);
-    }
-  });
-
-  const validSourceIds = new Set([...externalInputIds, ...producedIds]);
   const invalidIds = new Set();
-  const internalOnlyIds = new Set();
-
   items.forEach((item) => {
-    const hasExternal = externalInputIds.has(item.id);
-    const hasProduction = producedIds.has(item.id);
-    const isReferenced = referencedIds.has(item.id);
-    if (!hasExternal) internalOnlyIds.add(item.id);
-    if (!hasExternal && !hasProduction && isReferenced) invalidIds.add(item.id);
-  });
-
-  const recipeInputSelectableIds = items
-    .filter((item) => validSourceIds.has(item.id))
-    .map((item) => item.id);
-  const processInputSelectableIds = items
-    .filter((item) => validSourceIds.has(item.id))
-    .map((item) => item.id);
-  const processOutputSelectableIds = items
-    .filter((item) => producedIds.has(item.id))
-    .map((item) => item.id);
-
-  const roles = new Map();
-  items.forEach((item) => {
-    const roleParts = [];
-    if (externalInputIds.has(item.id)) roleParts.push("external_input");
-    if (producedIds.has(item.id)) roleParts.push("producible");
-    if (internalOnlyIds.has(item.id)) roleParts.push("internal_only");
-    if (invalidIds.has(item.id)) roleParts.push("invalid");
-    roles.set(item.id, roleParts);
+    const externallySupplied = externalInputIds.has(item.id);
+    const produced = producedIds.has(item.id);
+    const referencedAsInput = targetState.recipes.some((recipe) => recipe.inputs.some((row) => row.itemId === item.id));
+    if (!externallySupplied && !produced && referencedAsInput) invalidIds.add(item.id);
   });
 
   return {
     items,
     itemMap,
-    roles,
     externalInputIds,
+    externalRates,
     producedIds,
-    recipeInputReferencedIds,
-    recipeOutputReferencedIds,
-    processInputReferencedIds,
-    processOutputReferencedIds,
-    referencedIds,
-    validSourceIds,
-    invalidIds,
-    internalOnlyIds,
-    recipeInputSelectableIds,
-    processInputSelectableIds,
-    processOutputSelectableIds
+    invalidIds
   };
 }
 
-function getValidRecipeEntries(recipe, itemMap) {
-  const inputs = recipe.inputs
-    .map((row) => ({ ...row, qtyNum: parseNumber(row.qty) }))
-    .filter((row) => row.itemId && itemMap.has(row.itemId) && row.qtyNum !== null && row.qtyNum > 0);
-  const outputs = recipe.outputs
-    .map((row) => ({ ...row, qtyNum: parseNumber(row.qty) }))
-    .filter((row) => row.itemId && itemMap.has(row.itemId) && row.qtyNum !== null && row.qtyNum > 0);
-  return { inputs, outputs };
-}
-
-function syncRecipePair(recipe) {
-  const itemMap = getItemMap();
-  const { outputs } = getValidRecipeEntries(recipe, itemMap);
-  const primary = outputs[0];
-  if (!primary || !primary.qtyNum || primary.qtyNum <= 0) return;
-
-  if (recipe.syncSource === "time") {
-    const craft = parseNumber(recipe.craftTime);
-    if (craft !== null && craft > 0) {
-      recipe.outputRate = normalizeNumericString(String(primary.qtyNum * 60 / craft), 6);
-    }
-  } else {
-    const rate = parseNumber(recipe.outputRate);
-    if (rate !== null && rate > 0) {
-      recipe.craftTime = normalizeNumericString(String(primary.qtyNum * 60 / rate), 6);
-    }
-  }
-}
-
-function analyzeTopologyDistribution(totalFlow, targetBelts, allowedSizes, preferredDepth = 4) {
-  const sizes = allowedSizes.filter((size) => Number.isInteger(size) && size > 1);
-  if (targetBelts <= 0) {
-    return { exact: true, depth: 0, microBranches: 0, rates: [], imbalance: 0, details: "No branches." };
-  }
-
-  if (!sizes.length) {
-    const equal = Array.from({ length: targetBelts }, () => totalFlow / targetBelts);
-    return {
-      exact: targetBelts === 1,
-      depth: 0,
-      microBranches: targetBelts,
-      rates: equal,
-      imbalance: 0,
-      details: targetBelts === 1 ? "No split needed." : "No valid splitter or merger sizes defined."
-    };
-  }
-
-  const candidates = new Map([[1, 0]]);
-  let frontier = new Map([[1, 0]]);
-  for (let depth = 1; depth <= HARD_NETWORK_DEPTH; depth++) {
-    const next = new Map();
-    frontier.forEach((_, count) => {
-      sizes.forEach((size) => {
-        const candidate = count * size;
-        if (candidate > 256) return;
-        if (!candidates.has(candidate)) candidates.set(candidate, depth);
-        if (!next.has(candidate)) next.set(candidate, depth);
-      });
-    });
-    frontier = next;
-  }
-
-  const exactDepth = candidates.has(targetBelts) ? candidates.get(targetBelts) : null;
-  if (exactDepth !== null && exactDepth <= HARD_NETWORK_DEPTH) {
-    return {
-      exact: true,
-      depth: exactDepth,
-      microBranches: targetBelts,
-      rates: Array.from({ length: targetBelts }, () => totalFlow / targetBelts),
-      imbalance: 0,
-      details: `Exact topology available at depth ${exactDepth}.`
-    };
-  }
-
-  const reachable = [...candidates.entries()]
-    .map(([count, depth]) => ({ count, depth }))
-    .filter((entry) => entry.count >= targetBelts)
-    .sort((a, b) => a.count - b.count || a.depth - b.depth);
-
+function chooseRecipeCandidate(candidates, requiredRate, settings, machineMap) {
   let best = null;
-  reachable.forEach((candidate) => {
-    const base = Math.floor(candidate.count / targetBelts);
-    const remainder = candidate.count % targetBelts;
-    const rates = Array.from({ length: targetBelts }, (_, index) => {
-      const pieces = index < remainder ? base + 1 : base;
-      return totalFlow * pieces / candidate.count;
-    });
-    const imbalance = rates.length ? Math.max(...rates) - Math.min(...rates) : 0;
-    const depthPenalty = candidate.depth > preferredDepth ? 1000 : 0;
-    const score = imbalance * 100000 + depthPenalty + candidate.depth * 10 + candidate.count / 1000;
-    if (!best || score < best.score) best = { ...candidate, rates, imbalance, score };
+  candidates.forEach((recipe) => {
+    const machine = machineMap.get(recipe.machineClassId);
+    const outputQty = parseNumber(recipe.outputQty);
+    const baseRate = parseNumber(recipe.itemsPerMinute);
+    if (!machine || outputQty === null || outputQty <= 0 || baseRate === null || baseRate <= 0) return;
+
+    let machineCount = Math.max(1, Math.ceil(requiredRate / (baseRate * settings.maxClock / 100)));
+    let clock = ceilTwoDecimals(requiredRate / (baseRate * machineCount) * 100);
+    while (clock > settings.maxClock) {
+      machineCount += 1;
+      clock = ceilTwoDecimals(requiredRate / (baseRate * machineCount) * 100);
+    }
+
+    let actualRate = requiredRate;
+    let overflowRate = 0;
+    if (clock < settings.minClock) {
+      if (!settings.enableOverflow) return;
+      clock = settings.minClock;
+      actualRate = baseRate * machineCount * (clock / 100);
+      overflowRate = Math.max(0, actualRate - requiredRate);
+    } else {
+      actualRate = baseRate * machineCount * (clock / 100);
+      overflowRate = Math.max(0, actualRate - requiredRate);
+    }
+
+    const powerUse = machineCount * machine.power * (clock / 100);
+    const score = powerUse * 1000 + machineCount * 10 + overflowRate;
+    const candidate = { recipe, machine, outputQty, baseRate, machineCount, clock, actualRate, overflowRate, powerUse, score };
+    if (!best || candidate.score < best.score) best = candidate;
+  });
+  return best;
+}
+
+function mergeMaps(target, source) {
+  source.forEach((value, key) => {
+    target.set(key, (target.get(key) || 0) + value);
+  });
+}
+
+function solveFactory(targetState = state) {
+  const settings = getSettingsNumbers(targetState);
+  const roleState = deriveItemRoles(targetState);
+  const machineMap = getMachineClassMap(targetState);
+  const machineList = getDefinedMachineClasses(targetState);
+  const items = roleState.items;
+  const errors = [];
+  const warnings = [];
+
+  const { duplicates, duplicateIds, uniqueRecipes } = buildRecipeCatalog(targetState);
+  const recipeByOutput = new Map();
+  uniqueRecipes.forEach((recipe) => {
+    if (!recipe.outputItemId) return;
+    if (!recipeByOutput.has(recipe.outputItemId)) recipeByOutput.set(recipe.outputItemId, []);
+    recipeByOutput.get(recipe.outputItemId).push(recipe);
   });
 
-  if (!best) {
+  roleState.invalidIds.forEach((itemId) => {
+    errors.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} is used as an input but has no external belt supply and no producing recipe.`);
+  });
+
+  if (!settings.targetOutputItemId) {
     return {
-      exact: false,
-      depth: HARD_NETWORK_DEPTH,
-      microBranches: 0,
-      rates: Array.from({ length: targetBelts }, () => 0),
-      imbalance: 0,
-      details: "No feasible topology within depth limits."
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalTotals: roleState.externalRates,
+      machinePlans: [],
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      targetNode: null
     };
   }
 
-  return {
-    exact: false,
-    depth: best.depth,
-    microBranches: best.count,
-    rates: best.rates,
-    imbalance: best.imbalance,
-    details: `Balanced approximation using ${best.count} micro-branches at depth ${best.depth}.`
-  };
-}
-
-function buildGraphAnalysis() {
-  const roleState = deriveItemRoles();
-  const items = roleState.items;
-  const itemMap = roleState.itemMap;
-  const settings = getSettingsNumbers();
-  const edges = state.processRows
-    .filter(isValidProcessRow)
-    .map((row, index) => ({
-      rowId: row.id,
-      source: row.inputItemId,
-      target: row.outputItemId,
-      index: index + 1,
-      flow: 0,
-      exact: true,
-      approx: null,
-      merge: false
-    }));
-
-  const incoming = new Map();
-  const outgoing = new Map();
-  const definedIds = new Set(items.map((item) => item.id));
-  definedIds.forEach((id) => {
-    incoming.set(id, []);
-    outgoing.set(id, []);
-  });
-
-  edges.forEach((edge) => {
-    if (!outgoing.has(edge.source)) outgoing.set(edge.source, []);
-    if (!incoming.has(edge.target)) incoming.set(edge.target, []);
-    outgoing.get(edge.source).push(edge);
-    incoming.get(edge.target).push(edge);
-  });
-
-  const externalFlows = {};
-  items.forEach((item) => {
-    externalFlows[item.id] = item.belts
-      .map((belt) => parseNumber(belt.value))
-      .filter((num) => num !== null && num >= 0)
-      .reduce((sum, num) => sum + num, 0);
-  });
-
-  const indegree = new Map();
-  definedIds.forEach((id) => indegree.set(id, 0));
-  edges.forEach((edge) => indegree.set(edge.target, (indegree.get(edge.target) || 0) + 1));
-
-  const queue = [];
-  indegree.forEach((value, key) => { if (value === 0) queue.push(key); });
-
-  const order = [];
-  while (queue.length) {
-    const current = queue.shift();
-    order.push(current);
-    (outgoing.get(current) || []).forEach((edge) => {
-      indegree.set(edge.target, indegree.get(edge.target) - 1);
-      if (indegree.get(edge.target) === 0) queue.push(edge.target);
-    });
+  const targetItem = roleState.itemMap.get(settings.targetOutputItemId);
+  if (!targetItem) {
+    errors.push("Target output item is not defined.");
+    return {
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalTotals: roleState.externalRates,
+      machinePlans: [],
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      targetNode: null
+    };
   }
 
-  const hasCycle = order.length < definedIds.size && edges.length > 0;
-  if (hasCycle) definedIds.forEach((id) => { if (!order.includes(id)) order.push(id); });
+  const targetRate = settings.targetOutputRate;
+  if (!(targetRate > 0)) {
+    errors.push("Target output rate must be greater than zero.");
+    return {
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalTotals: roleState.externalRates,
+      machinePlans: [],
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      targetNode: null
+    };
+  }
 
-  const totalFlows = {};
-  definedIds.forEach((id) => totalFlows[id] = externalFlows[id] || 0);
+  const planMap = new Map();
+  const externalDemand = new Map();
+  const overflowBelts = [];
+  let nextOverflowBelt = 1;
 
-  const splitAnalyses = [];
-  const mergeAnalyses = [];
+  function solveItem(itemId, requiredRate, trail = []) {
+    if (trail.includes(itemId)) return { ok: false, error: `Cycle detected involving ${roleState.itemMap.get(itemId)?.name || "Unknown"}.` };
+    const item = roleState.itemMap.get(itemId);
+    if (!item) return { ok: false, error: "Unknown item in solver." };
 
-  order.forEach((itemId) => {
-    const sourceTotal = totalFlows[itemId] || 0;
-    const sourceEdges = outgoing.get(itemId) || [];
-    if (!sourceEdges.length) return;
-    const distribution = analyzeTopologyDistribution(sourceTotal, sourceEdges.length, settings.splitterSizes, MAX_NETWORK_DEPTH);
-    sourceEdges.forEach((edge, index) => {
-      edge.flow = distribution.rates[index] || 0;
-      edge.exact = distribution.exact;
-      edge.approx = distribution;
-      totalFlows[edge.target] = (totalFlows[edge.target] || 0) + edge.flow;
-    });
-    splitAnalyses.push({
-      itemId,
-      itemName: itemMap.get(itemId)?.name || "Unknown",
-      totalFlow: sourceTotal,
-      outputs: sourceEdges.length,
-      ...distribution
-    });
-  });
+    if (roleState.externalInputIds.has(itemId)) {
+      const node = { type: "external", itemId, label: item.name, rate: requiredRate, children: [] };
+      externalDemand.set(itemId, (externalDemand.get(itemId) || 0) + requiredRate);
+      return { ok: true, node, power: 0 };
+    }
 
-  edges.forEach((edge) => { edge.merge = (incoming.get(edge.target) || []).length > 1; });
+    const candidates = recipeByOutput.get(itemId) || [];
+    const chosen = chooseRecipeCandidate(candidates, requiredRate, settings, machineMap);
+    if (!chosen) return { ok: false, error: `${item.name} is not externally supplied and no valid recipe can produce it.` };
 
-  incoming.forEach((list, itemId) => {
-    if (list.length > 1) {
-      const total = list.reduce((sum, edge) => sum + edge.flow, 0);
-      mergeAnalyses.push({
-        itemId,
-        itemName: itemMap.get(itemId)?.name || "Unknown",
-        inputs: list.length,
-        totalFlow: total,
-        ...analyzeTopologyDistribution(total, list.length, settings.mergerSizes, MAX_NETWORK_DEPTH)
+    const inputNodes = [];
+    for (const row of chosen.recipe.inputs) {
+      const qty = parseNumber(row.qty);
+      if (!row.itemId || qty === null || qty <= 0) continue;
+      const neededRate = chosen.actualRate * qty / chosen.outputQty;
+      const inputResult = solveItem(row.itemId, neededRate, [...trail, itemId]);
+      if (!inputResult.ok) return inputResult;
+      inputNodes.push(inputResult.node);
+    }
+
+    if (chosen.overflowRate > 0) {
+      const beltId = nextOverflowBelt++;
+      overflowBelts.push({ id: beltId, itemId, itemName: item.name, rate: chosen.overflowRate, recipeId: chosen.recipe.id });
+      warnings.push(`The recipe ${item.name} produces more output per power than a tighter-fit alternative. Excess will be generated. Overflow belt assigned: Belt ${beltId}`);
+    }
+
+    if (!planMap.has(chosen.recipe.id)) {
+      planMap.set(chosen.recipe.id, {
+        recipeId: chosen.recipe.id,
+        outputItemId: itemId,
+        outputItemName: item.name,
+        machineClassId: chosen.machine.id,
+        machineName: chosen.machine.name,
+        machinePower100: chosen.machine.power,
+        requiredRate: 0,
+        actualRate: 0,
+        machineCount: 0,
+        clock: 0,
+        powerUse: 0,
+        recipe: chosen.recipe
       });
     }
+
+    const plan = planMap.get(chosen.recipe.id);
+    plan.requiredRate += requiredRate;
+    plan.actualRate += chosen.actualRate;
+    plan.machineCount += chosen.machineCount;
+    plan.powerUse += chosen.powerUse;
+    plan.clock = Math.max(plan.clock, chosen.clock);
+
+    return {
+      ok: true,
+      power: chosen.powerUse + inputNodes.reduce((sum, node) => sum + (node.powerUse || 0), 0),
+      node: {
+        type: "recipe",
+        recipeId: chosen.recipe.id,
+        outputItemId: itemId,
+        label: item.name,
+        machineName: chosen.machine.name,
+        requiredRate,
+        actualRate: chosen.actualRate,
+        overflowRate: chosen.overflowRate,
+        children: inputNodes,
+        powerUse: chosen.powerUse
+      }
+    };
+  }
+
+  const targetResult = solveItem(settings.targetOutputItemId, targetRate, []);
+  if (!targetResult.ok) errors.push(targetResult.error);
+
+  externalDemand.forEach((demand, itemId) => {
+    const available = roleState.externalRates.get(itemId) || 0;
+    if (demand > available) {
+      errors.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} requires ${fmt(demand)} item/min, but only ${fmt(available)} item/min is externally available.`);
+    }
   });
 
+  const machinePlans = [...planMap.values()];
+  const totalPower = machinePlans.reduce((sum, plan) => sum + plan.powerUse, 0);
+  if (totalPower > settings.maxPower) warnings.push(`Power limit exceeded by ${fmt(totalPower - settings.maxPower)} MW.`);
+  if (duplicates.size) warnings.push("Duplicate recipes detected. Only the first instance of each duplicate set is used by the solver.");
+
   return {
-    items,
-    itemMap,
+    settings,
     roleState,
-    edges,
-    incoming,
-    outgoing,
-    externalFlows,
-    totalFlows,
-    hasCycle,
-    splitAnalyses,
-    mergeAnalyses,
-    exactRouting: !hasCycle && splitAnalyses.every((entry) => entry.exact) && mergeAnalyses.every((entry) => entry.exact),
-    approximateNeeded: hasCycle || splitAnalyses.some((entry) => !entry.exact) || mergeAnalyses.some((entry) => !entry.exact)
+    machineList,
+    duplicateIds,
+    duplicateGroups: duplicates,
+    externalTotals: roleState.externalRates,
+    externalDemand,
+    machinePlans,
+    totalPower,
+    overflowBelts,
+    warnings: [...new Set(warnings)],
+    errors,
+    reachable: errors.length === 0 && Boolean(targetResult.ok),
+    targetNode: targetResult.ok ? targetResult.node : null
   };
 }
 
-function buildRecipeAnalysis(graph) {
-  const settings = getSettingsNumbers();
-  const analyses = [];
-  let totalPower = 0;
-
-  state.recipes.forEach((recipe) => {
-    const { inputs, outputs } = getValidRecipeEntries(recipe, graph.itemMap);
-    if (!recipe.name.trim() && !inputs.length && !outputs.length && !recipe.outputRate && !recipe.craftTime && !recipe.power) return;
-
-    const power100 = parseNumber(recipe.power) ?? 0;
-    const desiredOutput = parseNumber(recipe.outputRate);
-    const craftTime = parseNumber(recipe.craftTime);
-    const primary = outputs[0];
-    const warnings = [];
-    if (!recipe.name.trim()) warnings.push("Machine class label missing.");
-    if (!inputs.length) warnings.push("No valid input items.");
-    if (!outputs.length) warnings.push("No valid output items.");
-    if (!primary) {
-      analyses.push({ id: recipe.id, name: recipe.name.trim() || "Unnamed machine", warnings, valid: false });
-      return;
-    }
-
-    let baseOutputRate = null;
-    if (craftTime !== null && craftTime > 0) baseOutputRate = primary.qtyNum * 60 / craftTime;
-    else if (desiredOutput !== null && desiredOutput > 0) baseOutputRate = desiredOutput;
-    if (baseOutputRate === null || baseOutputRate <= 0) {
-      warnings.push("Primary output rate is not calculable.");
-      analyses.push({ id: recipe.id, name: recipe.name.trim() || "Unnamed machine", warnings, valid: false });
-      return;
-    }
-
-    const supportCandidates = inputs.map((input) => {
-      const available = graph.totalFlows[input.itemId] || 0;
-      return {
-        itemId: input.itemId,
-        itemName: graph.itemMap.get(input.itemId)?.name || "Unknown",
-        qty: input.qtyNum,
-        available,
-        maxCrafts: input.qtyNum > 0 ? available / input.qtyNum : 0
-      };
-    });
-
-    const maxCraftsByInputs = supportCandidates.length ? Math.min(...supportCandidates.map((entry) => entry.maxCrafts)) : Number.POSITIVE_INFINITY;
-    const maxOutputFromInputs = Number.isFinite(maxCraftsByInputs) ? maxCraftsByInputs * primary.qtyNum : desiredOutput ?? baseOutputRate;
-    const requestedOutput = desiredOutput ?? baseOutputRate;
-    const actualOutput = Math.max(0, Math.min(requestedOutput, maxOutputFromInputs));
-    const bottleneck = supportCandidates.length
-      ? supportCandidates.reduce((lowest, current) => current.maxCrafts < lowest.maxCrafts ? current : lowest, supportCandidates[0])
-      : null;
-
-    let machineCount = actualOutput > 0 ? 1 : 0;
-    let clock = actualOutput > 0 ? ceilTwoDecimals(actualOutput / baseOutputRate * 100) : 0;
-    while (machineCount > 0 && clock > settings.maxClock) {
-      machineCount += 1;
-      clock = ceilTwoDecimals(actualOutput / (baseOutputRate * machineCount) * 100);
-    }
-    if (machineCount > 0 && clock < settings.minClock) {
-      warnings.push(`Required clock ${fmt(clock)}% is below the allowed minimum ${fmt(settings.minClock)}%.`);
-    }
-
-    const powerUse = machineCount * power100 * (clock / 100);
-    totalPower += powerUse;
-    if (actualOutput < requestedOutput) {
-      warnings.push(bottleneck
-        ? `Bottleneck: ${bottleneck.itemName} limits this machine to ${fmt(actualOutput)} item/min output.`
-        : "Output limited by available inputs.");
-    }
-
-    analyses.push({
-      id: recipe.id,
-      name: recipe.name.trim() || "Unnamed machine",
-      valid: true,
-      warnings,
-      inputs,
-      outputs,
-      baseOutputRate,
-      requestedOutput,
-      actualOutput,
-      machineCount,
-      clock,
-      powerUse,
-      bottleneck,
-      power100,
-      craftTime: craftTime ?? (primary.qtyNum * 60 / baseOutputRate)
-    });
-  });
-
-  return { analyses, totalPower, withinPower: totalPower <= settings.maxPower };
+function treeDepth(node) {
+  if (!node) return 0;
+  if (!node.children?.length) return 1;
+  return 1 + Math.max(...node.children.map(treeDepth));
 }
 
-function buildSummary() {
-  const graph = buildGraphAnalysis();
-  const recipes = buildRecipeAnalysis(graph);
-  const settings = getSettingsNumbers();
-  const warnings = [];
-  const errors = [];
-  const duplicateNames = findDuplicateItemNames(graph.items);
-  if (duplicateNames.length) warnings.push(`Duplicate item names: ${duplicateNames.join(", ")}.`);
-  if (graph.hasCycle) warnings.push("Cycle detected in process graph. Flow propagation uses a non-cyclic fallback order.");
-  if (!graph.exactRouting && graph.approximateNeeded) warnings.push("Some split or merge topologies require balanced approximation.");
-  if (!recipes.withinPower) warnings.push(`Power limit exceeded by ${fmt(recipes.totalPower - settings.maxPower)} MW.`);
-  graph.splitAnalyses.forEach((entry) => { if (!entry.exact) warnings.push(`${entry.itemName} split to ${entry.outputs} outputs is approximate: imbalance ${fmt(entry.imbalance)} item/min.`); });
-  graph.mergeAnalyses.forEach((entry) => { if (!entry.exact) warnings.push(`${entry.itemName} merge from ${entry.inputs} inputs is approximate within allowed merger sizes.`); });
-
-  graph.roleState.invalidIds.forEach((itemId) => {
-    const itemName = graph.itemMap.get(itemId)?.name || "Unknown";
-    errors.push(`${itemName} is referenced but has neither belt input nor any producing recipe.`);
-  });
-
-  state.processRows
-    .filter(isValidProcessRow)
-    .forEach((row) => {
-      const inputName = graph.itemMap.get(row.inputItemId)?.name || "Unknown";
-      const outputName = graph.itemMap.get(row.outputItemId)?.name || "Unknown";
-      if (!graph.roleState.validSourceIds.has(row.inputItemId)) {
-        errors.push(`Process input ${inputName} has no valid source. It must come from belts or a producing recipe.`);
-      }
-      if (!graph.roleState.producedIds.has(row.outputItemId)) {
-        errors.push(`Process output ${outputName} is invalid because no recipe produces it.`);
-      }
-    });
-
-  state.recipes.forEach((recipe) => {
-    recipe.inputs.forEach((row) => {
-      if (!row.itemId || !graph.itemMap.has(row.itemId)) return;
-      const itemName = graph.itemMap.get(row.itemId)?.name || "Unknown";
-      if (!graph.roleState.validSourceIds.has(row.itemId)) {
-        errors.push(`Recipe input ${itemName} has no valid source. Add belt input or a producing recipe.`);
-      }
-    });
-  });
-
-  return { graph, recipes, settings, warnings, errors };
-}
-
-function layoutGraph(summary) {
-  const { graph } = summary;
-  const nodes = new Map();
-  const relevantIds = new Set();
-  graph.edges.forEach((edge) => {
-    relevantIds.add(edge.source);
-    relevantIds.add(edge.target);
-  });
-
-  if (!relevantIds.size) {
-    return { nodes, edges: graph.edges, width: 1200, height: 480, machinesY: 340 };
+function assignTreePositions(node, depth = 0, positions = [], cursor = { y: 80 }) {
+  if (!node) return positions;
+  const children = node.children || [];
+  if (!children.length) {
+    const y = cursor.y;
+    cursor.y += 120;
+    positions.push({ node, depth, x: 100 + depth * 260, y });
+    return positions;
   }
-
-  const parents = new Map();
-  const children = new Map();
-  relevantIds.forEach((id) => {
-    parents.set(id, []);
-    children.set(id, []);
-  });
-  graph.edges.forEach((edge) => {
-    parents.get(edge.target)?.push(edge.source);
-    children.get(edge.source)?.push(edge.target);
-  });
-
-  const memo = new Map();
-  const stack = new Set();
-  function levelOf(id) {
-    if (memo.has(id)) return memo.get(id);
-    if (stack.has(id)) return 0;
-    stack.add(id);
-    const p = parents.get(id) || [];
-    let level = 0;
-    if (p.length === 1) level = levelOf(p[0]) + 1;
-    else if (p.length > 1) level = Math.max(...p.map(levelOf)) + 1;
-    stack.delete(id);
-    memo.set(id, level);
-    return level;
-  }
-
-  relevantIds.forEach((id) => levelOf(id));
-
-  const groups = new Map();
-  relevantIds.forEach((id) => {
-    const level = memo.get(id) || 0;
-    if (!groups.has(level)) groups.set(level, []);
-    groups.get(level).push(id);
-  });
-
-  const levels = [...groups.keys()].sort((a, b) => a - b);
-  const columnSpacing = 250;
-  const rowSpacing = 120;
-  const nodeWidth = 170;
-  const nodeHeight = 62;
-  const positions = new Map();
-  let maxY = 100;
-
-  levels.forEach((level) => {
-    const ids = groups.get(level);
-    ids.sort((a, b) => {
-      const pa = parents.get(a) || [];
-      const pb = parents.get(b) || [];
-      const avgA = pa.length ? pa.reduce((sum, id) => sum + (positions.get(id)?.y || 80), 0) / pa.length : 80;
-      const avgB = pb.length ? pb.reduce((sum, id) => sum + (positions.get(id)?.y || 80), 0) / pb.length : 80;
-      return avgA - avgB || (graph.itemMap.get(a)?.name || "").localeCompare(graph.itemMap.get(b)?.name || "");
-    });
-
-    ids.forEach((id, index) => {
-      const p = parents.get(id) || [];
-      let y;
-      if (!p.length) {
-        y = 90 + index * rowSpacing;
-      } else if (p.length === 1) {
-        const parentPos = positions.get(p[0]);
-        const siblings = (children.get(p[0]) || []).length;
-        if (siblings === 1) {
-          y = parentPos ? parentPos.y : 90 + index * rowSpacing;
-        } else {
-          const childIds = (children.get(p[0]) || []).slice().sort();
-          const siblingIndex = childIds.indexOf(id);
-          const offset = (siblingIndex - (siblings - 1) / 2) * 90;
-          y = (parentPos ? parentPos.y : 90) + offset;
-        }
-      } else {
-        const average = p.reduce((sum, parentId) => sum + (positions.get(parentId)?.y || 90), 0) / p.length;
-        y = average + 60;
-      }
-      positions.set(id, { x: 90 + level * columnSpacing, y, width: nodeWidth, height: nodeHeight });
-      maxY = Math.max(maxY, y + nodeHeight / 2 + 30);
-    });
-  });
-
-  const width = Math.max(1200, levels.length * columnSpacing + 340);
-  const machinesY = maxY + 70;
-  const machineRows = Math.ceil(summary.recipes.analyses.length / 4);
-  const height = Math.max(480, machinesY + machineRows * 90 + 80);
-
-  relevantIds.forEach((id) => {
-    const item = graph.itemMap.get(id);
-    nodes.set(id, {
-      ...positions.get(id),
-      id,
-      name: item?.name || "Unknown",
-      color: item?.color || "#888",
-      totalFlow: graph.totalFlows[id] || 0,
-      externalFlow: graph.externalFlows[id] || 0
-    });
-  });
-
-  return { nodes, edges: graph.edges, width, height, machinesY };
+  const childPositions = [];
+  children.forEach((child) => assignTreePositions(child, depth + 1, childPositions, cursor));
+  const y = childPositions.reduce((sum, entry) => sum + entry.y, 0) / childPositions.length;
+  positions.push({ node, depth, x: 100 + depth * 260, y });
+  childPositions.forEach((entry) => positions.push(entry));
+  return positions;
 }
 
-function edgePath(sourceNode, targetNode) {
-  return `M ${sourceNode.x + sourceNode.width} ${sourceNode.y} L ${targetNode.x} ${targetNode.y}`;
-}
-
-function renderBoard(summary) {
-  const layout = layoutGraph(summary);
-  const { nodes, edges, width, height, machinesY } = layout;
-  if (!edges.length) {
+function renderSolverBoard(solution) {
+  if (!solution.targetNode) {
     return `
-      <svg viewBox="0 0 1200 480" role="img" aria-label="Visual network board">
-        <text x="600" y="200" text-anchor="middle" class="board-placeholder">No network yet</text>
-        <text x="600" y="230" text-anchor="middle" class="board-placeholder-sub">Define items, recipes, and process links above. The board stays live and ready.</text>
+      <svg viewBox="0 0 1200 480" role="img" aria-label="Solver board">
+        <text x="600" y="200" text-anchor="middle" class="board-placeholder">No solved production chain yet</text>
+        <text x="600" y="230" text-anchor="middle" class="board-placeholder-sub">Define machine classes and recipes, then choose a target output.</text>
       </svg>
     `;
   }
 
+  const positions = assignTreePositions(solution.targetNode);
+  const deduped = [];
+  const seen = new Set();
+  positions.forEach((entry) => {
+    const key = `${entry.node.type}:${entry.node.recipeId || entry.node.itemId}:${entry.depth}:${Math.round(entry.y)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    deduped.push(entry);
+  });
+
+  const width = Math.max(1200, (treeDepth(solution.targetNode) + 1) * 270 + 180);
+  const height = Math.max(480, deduped.reduce((max, entry) => Math.max(max, entry.y), 120) + 120);
+  const nodeWidth = 190;
+  const nodeHeight = 70;
+
   let svg = `
-    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Visual network board">
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Solver board">
       <defs>
-        <marker id="arrow-head" markerWidth="12" markerHeight="8" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
-          <path d="M0,0 L12,4 L0,8 z" fill="#4b4234"></path>
+        <marker id="solver-arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+          <path d="M0,0 L10,4 L0,8 z" fill="#4b4234"></path>
         </marker>
       </defs>
   `;
 
-  edges.forEach((edge) => {
-    const source = nodes.get(edge.source);
-    const target = nodes.get(edge.target);
-    if (!source || !target) return;
-    const stroke = summary.graph.items.length === 1 ? "#111" : (source.color || "#111");
-    const labelColor = contrastColor(stroke);
-    const path = edgePath(source, target);
-    const midX = (source.x + source.width + target.x) / 2;
-    const midY = (source.y + target.y) / 2 - 8;
-    const label = `B${edge.index} · ${fmt(edge.flow)} /min`;
-    if (edge.merge) {
-      svg += `
-        <g class="merge-group" data-delete-row="${edge.rowId}">
-          <path class="edge-outline" d="${path}" fill="none" stroke="transparent" stroke-width="1"></path>
-          <path class="edge-main" d="${path}" fill="none" stroke="${stroke}" stroke-width="2.2" marker-end="url(#arrow-head)"></path>
-          <path class="edge-hit" d="${path}" data-delete-row="${edge.rowId}"></path>
-          <text x="${midX}" y="${midY}" text-anchor="middle" class="edge-label" fill="${labelColor}">${escapeHtml(label)}</text>
-        </g>
-      `;
-    } else {
-      svg += `
-        <g>
-          <path d="${path}" fill="none" stroke="${stroke}" stroke-width="2.2" marker-end="url(#arrow-head)"></path>
-          <text x="${midX}" y="${midY}" text-anchor="middle" class="edge-label" fill="${labelColor}">${escapeHtml(label)}</text>
-        </g>
-      `;
-    }
+  deduped.forEach((entry) => {
+    (entry.node.children || []).forEach((child) => {
+      const childEntry = deduped.find((candidate) => candidate.node === child);
+      if (!childEntry) return;
+      svg += `<path d="M ${childEntry.x + nodeWidth} ${childEntry.y} L ${entry.x} ${entry.y}" fill="none" stroke="#5d533f" stroke-width="2.2" marker-end="url(#solver-arrow)"></path>`;
+    });
   });
 
-  nodes.forEach((node) => {
+  deduped.forEach((entry) => {
+    const isExternal = entry.node.type === "external";
     svg += `
       <g class="graph-node">
-        <rect x="${node.x}" y="${node.y - node.height / 2}" width="${node.width}" height="${node.height}"></rect>
-        <rect class="accent" x="${node.x}" y="${node.y - node.height / 2}" width="10" height="${node.height}" fill="${escapeHtml(node.color)}"></rect>
-        <text x="${node.x + 20}" y="${node.y - 7}" class="graph-label">${escapeHtml(node.name)}</text>
-        <text x="${node.x + 20}" y="${node.y + 13}" class="graph-sub">Total ${escapeHtml(fmt(node.totalFlow))} item/min</text>
-        <text x="${node.x + 20}" y="${node.y + 28}" class="graph-sub">Input ${escapeHtml(fmt(node.externalFlow))} item/min</text>
-      </g>
-    `;
-  });
-
-  summary.recipes.analyses.forEach((recipe, index) => {
-    const x = 80 + (index % 4) * 270;
-    const y = machinesY + Math.floor(index / 4) * 86;
-    svg += `
-      <g class="machine-box">
-        <rect x="${x}" y="${y}" width="230" height="56"></rect>
-        <text x="${x + 12}" y="${y + 22}">${escapeHtml(recipe.name)}</text>
-        <text x="${x + 12}" y="${y + 40}">${escapeHtml(`${recipe.machineCount || 0}x · ${fmt(recipe.clock || 0)}% · ${fmt(recipe.actualOutput || 0)} /min`)}</text>
+        <rect x="${entry.x}" y="${entry.y - nodeHeight / 2}" width="${nodeWidth}" height="${nodeHeight}" fill="${isExternal ? "rgba(245,235,210,0.92)" : "rgba(255,255,255,0.92)"}"></rect>
+        <text x="${entry.x + 16}" y="${entry.y - 10}" class="graph-label">${escapeHtml(entry.node.label)}</text>
+        <text x="${entry.x + 16}" y="${entry.y + 10}" class="graph-sub">${escapeHtml(isExternal ? "External input" : entry.node.machineName)}</text>
+        <text x="${entry.x + 16}" y="${entry.y + 28}" class="graph-sub">${escapeHtml(`${fmt(entry.node.actualRate || entry.node.rate)} item/min`)}</text>
       </g>
     `;
   });
@@ -1146,14 +910,48 @@ function renderBoard(summary) {
   return `${svg}</svg>`;
 }
 
+function openRecipeModal(recipeId = "") {
+  const recipe = recipeId ? state.recipes.find((entry) => entry.id === recipeId) : null;
+  recipeModalState.open = true;
+  recipeModalState.recipeId = recipeId || "";
+  recipeModalState.mode = recipe ? "edit" : "create";
+  recipeModalState.draft = createRecipeDraft(recipe || emptyRecipe());
+  document.body.style.overflow = "hidden";
+  renderRecipeModal();
+}
+
+function closeRecipeModal() {
+  recipeModalState.open = false;
+  recipeModalState.recipeId = "";
+  recipeModalState.draft = emptyRecipe();
+  document.body.style.overflow = "";
+  renderRecipeModal();
+}
+
+function saveRecipeModal() {
+  const draft = sanitizeRecipe(recipeModalState.draft);
+  const validation = getRecipeValidation(recipeModalState.draft);
+  if (!validation.valid) return;
+
+  if (recipeModalState.recipeId) {
+    const index = state.recipes.findIndex((entry) => entry.id === recipeModalState.recipeId);
+    if (index >= 0) state.recipes[index] = draft;
+  } else {
+    state.recipes.push(draft);
+  }
+
+  ensureStateStructure();
+  const duplicates = getDuplicateRecipeGroups();
+  if ([...duplicates.values()].some((ids) => ids.includes(draft.id))) {
+    alert("Duplicate recipe detected. Both recipe cards are marked in yellow. Only the first instance will be used during calculation.");
+  }
+  closeRecipeModal();
+  render();
+}
+
 function renderColorPicker() {
   const root = document.getElementById("color-picker-root");
   if (!root) return;
-  const targetRow = state.itemRows.find((entry) => entry.id === colorPickerState.targetItemId);
-  if (colorPickerState.open && (!targetRow || colorPickerState.targetField !== "color")) {
-    colorPickerState.open = false;
-    colorPickerState.targetItemId = "";
-  }
   if (!colorPickerState.open) {
     root.innerHTML = "";
     return;
@@ -1167,7 +965,7 @@ function renderColorPicker() {
   const rgb = hexToRgb(colorPickerState.draftHex);
 
   root.innerHTML = `
-    <div class="color-picker-backdrop" data-color-picker-close="backdrop"></div>
+    <div class="color-picker-backdrop" data-color-picker-close></div>
     <div class="color-picker-popup" role="dialog" aria-modal="true" aria-label="Color picker">
       <div class="color-picker-topbar">
         <strong>Color Picker</strong>
@@ -1192,48 +990,43 @@ function renderColorPicker() {
         </div>
       </div>
       <div class="color-picker-actions">
-        <button type="button" class="secondary" data-color-picker-close="cancel">Cancel</button>
-        <button type="button" data-color-picker-apply="apply">Apply</button>
+        <button type="button" class="secondary" data-color-picker-close>Cancel</button>
+        <button type="button" data-color-picker-apply>Apply</button>
       </div>
     </div>
   `;
-
   attachColorPickerEvents();
 }
 
 function syncColorPickerUi(container = document) {
   const svArea = container.querySelector("[data-color-picker-sv]");
-  const hueArea = container.querySelector("[data-color-picker-hue]");
   const svHandle = container.querySelector(".color-picker-handle");
   const hueHandle = container.querySelector(".color-hue-handle");
   const preview = container.querySelector(".color-preview-box");
-  const pill = container.querySelector("[data-color-picker-pill]");
   const hexValue = container.querySelector("[data-color-picker-hex]");
   const rgbValue = container.querySelector("[data-color-picker-rgb]");
-  if (!svArea || !hueArea || !svHandle || !hueHandle || !preview || !pill || !hexValue || !rgbValue) return;
+  const pill = container.querySelector("[data-color-picker-pill]");
+  if (!svArea || !svHandle || !hueHandle || !preview || !hexValue || !rgbValue || !pill) return;
 
   const hueRgb = hsvToRgb(colorPickerState.hue, 100, 100);
   const hueColor = rgbToHex(hueRgb.r, hueRgb.g, hueRgb.b);
   const rgb = hexToRgb(colorPickerState.draftHex);
-
   svArea.style.background = hueColor;
   svHandle.style.left = `${colorPickerState.sat}%`;
   svHandle.style.top = `${100 - colorPickerState.val}%`;
   hueHandle.style.top = `${(colorPickerState.hue / 360) * 100}%`;
   preview.style.background = colorPickerState.draftHex;
-  pill.textContent = colorPickerState.draftHex;
   hexValue.textContent = colorPickerState.draftHex;
   rgbValue.textContent = `${rgb.r}, ${rgb.g}, ${rgb.b}`;
+  pill.textContent = colorPickerState.draftHex;
 }
 
 function attachColorPickerEvents() {
   const root = document.getElementById("color-picker-root");
   if (!root) return;
-
   root.querySelectorAll("[data-color-picker-close]").forEach((element) => {
     element.onclick = () => closeColorPicker();
   });
-
   const applyButton = root.querySelector("[data-color-picker-apply]");
   if (applyButton) applyButton.onclick = () => applyColorPicker();
 
@@ -1242,31 +1035,26 @@ function attachColorPickerEvents() {
     element.onpointerdown = (event) => {
       event.preventDefault();
       if (typeof element.setPointerCapture === "function") element.setPointerCapture(event.pointerId);
-
       const move = (clientX, clientY) => {
         updater(clientX, clientY);
         updateColorPickerDraft();
         syncColorPickerUi(root);
       };
-
       move(event.clientX, event.clientY);
-
-      const onPointerMove = (moveEvent) => {
+      const onMove = (moveEvent) => {
         if (moveEvent.pointerId !== event.pointerId) return;
         move(moveEvent.clientX, moveEvent.clientY);
       };
-
       const stop = (endEvent) => {
         if (endEvent.pointerId !== event.pointerId) return;
         if (typeof element.releasePointerCapture === "function" && element.hasPointerCapture?.(endEvent.pointerId)) {
           element.releasePointerCapture(endEvent.pointerId);
         }
-        element.removeEventListener("pointermove", onPointerMove);
+        element.removeEventListener("pointermove", onMove);
         element.removeEventListener("pointerup", stop);
         element.removeEventListener("pointercancel", stop);
       };
-
-      element.addEventListener("pointermove", onPointerMove);
+      element.addEventListener("pointermove", onMove);
       element.addEventListener("pointerup", stop);
       element.addEventListener("pointercancel", stop);
     };
@@ -1289,25 +1077,178 @@ function attachColorPickerEvents() {
   syncColorPickerUi(root);
 }
 
+function renderRecipeModal() {
+  const root = document.getElementById("recipe-modal-root");
+  if (!root) return;
+  if (!recipeModalState.open) {
+    root.innerHTML = "";
+    return;
+  }
+
+  const items = getDefinedItems();
+  const machineClasses = getDefinedMachineClasses();
+  const roleState = deriveItemRoles();
+  const draft = recipeModalState.draft;
+  const validation = getRecipeValidation(draft);
+  const duplicateInputIds = validation.duplicateInputIds;
+  const outputSelectableItems = items.filter((item) => !roleState.externalInputIds.has(item.id));
+
+  root.innerHTML = `
+    <div class="modal-backdrop" data-recipe-modal-close></div>
+    <div class="modal-popup" role="dialog" aria-modal="true" aria-label="Recipe editor">
+      <div class="modal-header">
+        <strong>${recipeModalState.mode === "edit" ? "Edit Recipe" : "Add Recipe"}</strong>
+        <span class="pill">${validation.valid ? "Valid" : "Incomplete"}</span>
+      </div>
+      <div class="modal-section">
+        <div class="field-label">Inputs</div>
+        <div class="modal-grid">
+          ${draft.inputs.map((row) => {
+            const selectedIds = draft.inputs.filter((entry) => entry.id !== row.id && entry.itemId).map((entry) => entry.itemId);
+            return `
+              <div class="modal-row">
+                <select data-recipe-draft="input-item" data-row-id="${row.id}">
+                  <option value="">Select input item</option>
+                  ${items.filter((item) => !selectedIds.includes(item.id) || item.id === row.itemId).map((item) => `<option value="${item.id}" ${item.id === row.itemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
+                </select>
+                <input type="text" value="${escapeHtml(row.qty)}" placeholder="Qty per craft" data-recipe-draft="input-qty" data-row-id="${row.id}">
+                <div class="footnote ${duplicateInputIds.has(row.itemId) ? "warning-text" : ""}">${duplicateInputIds.has(row.itemId) ? "Duplicate input" : ""}</div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </div>
+      <div class="modal-section modal-two-col">
+        <div>
+          <label class="field-label">Output item</label>
+          <select data-recipe-draft="outputItemId">
+            <option value="">Select output item</option>
+            ${outputSelectableItems.map((item) => `<option value="${item.id}" ${item.id === draft.outputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label class="field-label">Output quantity per craft</label>
+          <input type="text" value="${escapeHtml(draft.outputQty)}" data-recipe-draft="outputQty">
+        </div>
+      </div>
+      <div class="modal-section modal-two-col">
+        <div>
+          <label class="field-label">Machine class</label>
+          <select data-recipe-draft="machineClassId">
+            <option value="">Select machine class</option>
+            ${machineClasses.map((machine) => `<option value="${machine.id}" ${machine.id === draft.machineClassId ? "selected" : ""}>${escapeHtml(machine.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <label class="field-label">Items per minute</label>
+          <input type="text" value="${escapeHtml(draft.itemsPerMinute)}" data-recipe-draft="itemsPerMinute">
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="secondary" data-recipe-modal-close>Cancel</button>
+        <button type="button" class="${validation.valid ? "modal-done-ready" : "modal-done-disabled"}" data-recipe-modal-save ${validation.valid ? "" : "disabled"}>Done</button>
+      </div>
+    </div>
+  `;
+  attachRecipeModalEvents();
+}
+
+function syncRecipeModalUi() {
+  const root = document.getElementById("recipe-modal-root");
+  if (!root || !recipeModalState.open) return;
+  const validation = getRecipeValidation(recipeModalState.draft);
+  const pill = root.querySelector(".modal-header .pill");
+  const saveButton = root.querySelector("[data-recipe-modal-save]");
+  if (pill) pill.textContent = validation.valid ? "Valid" : "Incomplete";
+  if (saveButton) {
+    saveButton.disabled = !validation.valid;
+    saveButton.className = validation.valid ? "modal-done-ready" : "modal-done-disabled";
+  }
+}
+
+function commitRecipeDraftField(field, rowId = "") {
+  const draft = recipeModalState.draft;
+  if (field === "itemsPerMinute") {
+    draft.itemsPerMinute = normalizeNumericString(draft.itemsPerMinute, 6);
+  } else if (field === "outputQty") {
+    draft.outputQty = normalizeNumericString(draft.outputQty, 6);
+  } else if (field === "input-qty") {
+    const row = draft.inputs.find((entry) => entry.id === rowId);
+    if (row) row.qty = normalizeNumericString(row.qty, 6);
+  }
+  ensureDraftInputRows(draft);
+}
+
+function attachRecipeModalEvents() {
+  const root = document.getElementById("recipe-modal-root");
+  if (!root) return;
+
+  root.querySelectorAll("[data-recipe-modal-close]").forEach((element) => {
+    element.onclick = () => closeRecipeModal();
+  });
+
+  const saveButton = root.querySelector("[data-recipe-modal-save]");
+  if (saveButton) saveButton.onclick = () => saveRecipeModal();
+
+  root.querySelectorAll("[data-recipe-draft]").forEach((element) => {
+    element.oninput = (event) => {
+      const field = element.dataset.recipeDraft;
+      if (field === "input-item" || field === "input-qty") {
+        const row = recipeModalState.draft.inputs.find((entry) => entry.id === element.dataset.rowId);
+        if (!row) return;
+        if (field === "input-item") row.itemId = event.target.value;
+        else row.qty = event.target.value;
+      } else {
+        recipeModalState.draft[field] = event.target.type === "checkbox" ? event.target.checked : event.target.value;
+      }
+      syncRecipeModalUi();
+    };
+    element.onchange = (event) => {
+      const field = element.dataset.recipeDraft;
+      if (field === "input-item") {
+        const row = recipeModalState.draft.inputs.find((entry) => entry.id === element.dataset.rowId);
+        if (!row) return;
+        row.itemId = event.target.value;
+        ensureDraftInputRows(recipeModalState.draft);
+        renderRecipeModal();
+        return;
+      }
+      if (field === "outputItemId" || field === "machineClassId") {
+        recipeModalState.draft[field] = event.target.value;
+        syncRecipeModalUi();
+      }
+    };
+    element.onblur = () => {
+      const field = element.dataset.recipeDraft;
+      commitRecipeDraftField(field, element.dataset.rowId);
+      renderRecipeModal();
+    };
+    element.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+      }
+    };
+  });
+}
+
 function render() {
-  ensureTrailingStructures();
-  sanitizeReferences();
+  ensureStateStructure();
   saveLocal();
 
-  const summary = buildSummary();
-  const items = summary.graph.items;
-  const roleState = summary.graph.roleState;
-  const itemRowStatuses = getItemRowStatuses();
-  const duplicateNames = findDuplicateItemNames(items);
+  const solution = solveFactory();
+  const items = getDefinedItems();
+  const machineClasses = getDefinedMachineClasses();
+  const roleState = deriveItemRoles();
+  const itemStatuses = getItemRowStatuses();
+  const machineStatuses = getMachineClassStatuses();
+  const duplicateRecipes = solution.duplicateIds;
+  const beltSpeedOptions = getSettingsNumbers().beltSpeeds.map((speed) => String(speed));
+  const targetItems = items.filter((item) => !roleState.externalInputIds.has(item.id));
   const clockMin = getClockSliderValue(state.settings.clockMin || 1);
   const clockMax = Math.max(clockMin, getClockSliderValue(state.settings.clockMax || 250));
   const sliderLeft = ((clockMin - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
   const sliderRight = ((clockMax - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
-  const recipeInputItems = items.filter((item) => roleState.recipeInputSelectableIds.includes(item.id));
-  const recipeOutputItems = items;
-  const processInputItems = items.filter((item) => roleState.processInputSelectableIds.includes(item.id));
-  const processOutputItems = items.filter((item) => roleState.processOutputSelectableIds.includes(item.id));
-  const beltSpeedOptions = summary.settings.beltSpeeds.map((speed) => String(speed));
 
   document.getElementById("app").innerHTML = `
     <div class="top-area">
@@ -1315,8 +1256,8 @@ function render() {
         <div class="toolbar-left">
           <div class="toolbar-title">FlowForge</div>
           <span class="pill">${items.length} items</span>
-          <span class="pill">${summary.graph.edges.length} graph links</span>
-          <span class="pill">${summary.recipes.analyses.length} machine classes</span>
+          <span class="pill">${machineClasses.length} machine classes</span>
+          <span class="pill">${state.recipes.length} recipes</span>
         </div>
         <div class="toolbar-right">
           <button type="button" data-action="save-json">Save JSON</button>
@@ -1331,15 +1272,15 @@ function render() {
           <h2>Item Definitions</h2>
           <div class="stack">
             ${state.itemRows.map((row, index) => `
-              <div class="item-row ${itemRowStatuses.get(row.id)?.valid ? "valid" : ""}">
+              <div class="item-row ${itemStatuses.get(row.id)?.valid ? "valid" : ""}">
                 <div class="row cols-4">
                   <div>
                     <label class="field-label">Item name</label>
-                    <input type="text" value="${escapeHtml(row.name)}" placeholder="Define item name" data-item-field="name" data-item-id="${row.id}">
+                    <input type="text" value="${escapeHtml(row.name)}" data-item-field="name" data-item-id="${row.id}">
                   </div>
                   <div>
                     <label class="field-label">Item color</label>
-                    <input type="text" value="${escapeHtml(row.color)}" placeholder="#ff8800 or tomato" data-item-field="color" data-item-id="${row.id}">
+                    <input type="text" value="${escapeHtml(row.color)}" data-item-field="color" data-item-id="${row.id}">
                   </div>
                   <div>
                     <label class="field-label">Color</label>
@@ -1351,7 +1292,7 @@ function render() {
                   </div>
                 </div>
                 <div class="footnote">
-                  ${itemRowStatuses.get(row.id)?.valid
+                  ${itemStatuses.get(row.id)?.valid
                     ? `Registered as <strong>${escapeHtml(row.name.trim())}</strong>.`
                     : index === state.itemRows.length - 1
                       ? "Leave one empty row available for the next item."
@@ -1360,7 +1301,6 @@ function render() {
               </div>
             `).join("")}
           </div>
-          ${duplicateNames.length ? `<div class="footnote danger-text" style="margin-top:8px">Duplicate item names disable clean references: ${escapeHtml(duplicateNames.join(", "))}.</div>` : ""}
 
           <h3>Item Cards</h3>
           <div class="item-card-grid">
@@ -1370,23 +1310,27 @@ function render() {
                   <div class="item-name">${escapeHtml(item.name)}</div>
                   <div class="color-chip" style="background:${escapeHtml(item.color)}"></div>
                 </div>
-                <div class="subtle">Input belts</div>
+                <div class="subtle">External input belts</div>
                 <div class="belt-rows">
-                  ${item.belts.map((belt) => `
-                    <div class="belt-row">
-                      <select data-belt-item="${item.id}" data-belt-id="${belt.id}">
-                        <option value=""></option>
-                        ${beltSpeedOptions.map((speed) => `<option value="${escapeHtml(speed)}" ${speed === String(belt.value) ? "selected" : ""}>${escapeHtml(speed)}</option>`).join("")}
-                      </select>
-                      <span class="unit">item/min</span>
-                    </div>
-                  `).join("")}
+                  ${(() => {
+                    const realInputExists = hasRealBeltInput(item);
+                    return item.belts.map((belt, beltIndex) => `
+                      <div class="belt-row">
+                        <select data-belt-item="${item.id}" data-belt-id="${belt.id}">
+                          ${beltIndex === 0 ? `<option value="__ONLY_OUTPUT__" ${!realInputExists ? "selected" : ""}>ONLY OUTPUT</option>` : ""}
+                          ${beltIndex > 0 ? `<option value="" ${belt.value === "" ? "selected" : ""}></option>` : ""}
+                          ${beltSpeedOptions.map((speed) => `<option value="${escapeHtml(speed)}" ${String(belt.value) === speed ? "selected" : ""}>${escapeHtml(speed)}</option>`).join("")}
+                        </select>
+                        <span class="unit">item/min</span>
+                      </div>
+                    `).join("");
+                  })()}
                 </div>
               </div>
             `).join("") : `
               <div class="item-card" style="--item-color:#777">
                 <div class="item-card-header"><div class="item-name">No items yet</div><div class="color-chip" style="background:#777"></div></div>
-                <div class="subtle">Define an item above to unlock belt inputs, recipe dropdowns, and graph nodes.</div>
+                <div class="subtle">Define an item above to unlock belts, machine classes, recipes, and the solver.</div>
               </div>
             `}
           </div>
@@ -1399,10 +1343,25 @@ function render() {
             <div><label class="field-label">Allowed splitter sizes</label><input type="text" value="${escapeHtml(state.settings.splitterSizes)}" data-setting="splitterSizes"></div>
             <div><label class="field-label">Allowed merger sizes</label><input type="text" value="${escapeHtml(state.settings.mergerSizes)}" data-setting="mergerSizes"></div>
             <div><label class="field-label">Maximum available power</label><input type="text" value="${escapeHtml(state.settings.maxPower)}" data-setting="maxPower"></div>
+            <div>
+              <label class="field-label">Target output item</label>
+              <select data-setting="targetOutputItemId">
+                <option value="">Select target</option>
+                ${targetItems.map((item) => `<option value="${item.id}" ${item.id === state.settings.targetOutputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
+              </select>
+            </div>
+            <div>
+              <label class="field-label">Target output rate (item/min)</label>
+              <input type="text" value="${escapeHtml(state.settings.targetOutputRate)}" data-setting="targetOutputRate">
+            </div>
+            <div class="stat-row">
+              <div>Enable overflow belts</div>
+              <div><input type="checkbox" data-setting-check="enableOverflow" ${state.settings.enableOverflow ? "checked" : ""}></div>
+            </div>
             <div class="clock-panel">
               <div style="display:flex;justify-content:space-between;gap:8px;align-items:center">
                 <strong>Clock speed interval</strong>
-                <span class="pill">${fmt(summary.settings.minClock)}% to ${fmt(summary.settings.maxClock)}%</span>
+                <span class="pill">${fmt(getSettingsNumbers().minClock)}% to ${fmt(getSettingsNumbers().maxClock)}%</span>
               </div>
               <div class="dual-slider">
                 <div class="dual-slider-track"></div>
@@ -1414,7 +1373,6 @@ function render() {
                 <div><label class="field-label">Minimum allowed clock</label><input type="text" value="${escapeHtml(state.settings.clockMin)}" data-setting="clockMin"></div>
                 <div><label class="field-label">Maximum allowed clock</label><input type="text" value="${escapeHtml(state.settings.clockMax)}" data-setting="clockMax"></div>
               </div>
-              <div class="footnote">Clock is always positive, supports decimals, and never calculates with 0%.</div>
             </div>
           </div>
         </section>
@@ -1422,23 +1380,22 @@ function render() {
         <section class="panel">
           <h2>Result Summary</h2>
           <div class="summary-list">
-            <div class="stat-row"><div>Exact routing</div><div class="value ${summary.graph.exactRouting ? "ok-text" : "warning-text"}">${summary.graph.exactRouting ? "Yes" : "No"}</div></div>
-            <div class="stat-row"><div>Approximation needed</div><div class="value ${summary.graph.approximateNeeded ? "warning-text" : "ok-text"}">${summary.graph.approximateNeeded ? "Yes" : "No"}</div></div>
-            <div class="stat-row"><div>Total machine power</div><div class="value ${summary.recipes.withinPower ? "" : "danger-text"}">${fmt(summary.recipes.totalPower)} / ${fmt(summary.settings.maxPower)} MW</div></div>
-            <div class="stat-row"><div>Clock interval</div><div class="value">${fmt(summary.settings.minClock)}% to ${fmt(summary.settings.maxClock)}%</div></div>
+            <div class="stat-row"><div>Target reachable</div><div class="value ${solution.reachable ? "ok-text" : "warning-text"}">${solution.reachable ? "Yes" : "No"}</div></div>
+            <div class="stat-row"><div>Machine classes</div><div class="value">${machineClasses.length}</div></div>
+            <div class="stat-row"><div>Total power</div><div class="value ${solution.totalPower > getSettingsNumbers().maxPower ? "danger-text" : ""}">${fmt(solution.totalPower || 0)} / ${fmt(getSettingsNumbers().maxPower)} MW</div></div>
+            <div class="stat-row"><div>Overflow belts</div><div class="value">${solution.overflowBelts.length}</div></div>
           </div>
 
-          <h3>Total Available Input</h3>
+          <h3>External Input Totals</h3>
           <div class="summary-list">
-            ${items.length ? items.map((item) => `<div class="stat-row"><div>${escapeHtml(item.name)}</div><div class="value">${fmt(summary.graph.totalFlows[item.id] || 0)} item/min</div></div>`).join("") : `<div class="footnote">No registered items yet.</div>`}
+            ${items.length ? items.map((item) => `<div class="stat-row"><div>${escapeHtml(item.name)}</div><div class="value">${fmt(solution.externalTotals.get(item.id) || 0)} item/min</div></div>`).join("") : `<div class="footnote">No items defined yet.</div>`}
           </div>
 
           <h3>Warnings And Errors</h3>
           <div class="summary-list">
-            ${summary.warnings.length
-              ? summary.warnings.map((warning) => `<div class="mini-summary warning-text">${escapeHtml(warning)}</div>`).join("")
-              : (summary.errors.length ? "" : `<div class="mini-summary ok-text">No active warnings. Routing and machine summaries are in a valid state.</div>`)}
-            ${summary.errors.map((error) => `<div class="mini-summary danger-text">${escapeHtml(error)}</div>`).join("")}
+            ${solution.warnings.length ? solution.warnings.map((warning) => `<div class="mini-summary warning-text">${escapeHtml(warning)}</div>`).join("") : ""}
+            ${solution.errors.length ? solution.errors.map((error) => `<div class="mini-summary danger-text">${escapeHtml(error)}</div>`).join("") : ""}
+            ${!solution.warnings.length && !solution.errors.length ? `<div class="mini-summary ok-text">No active warnings. The solver has a consistent state.</div>` : ""}
           </div>
         </section>
       </div>
@@ -1446,114 +1403,92 @@ function render() {
       <section class="recipes-shell">
         <div class="recipes-header">
           <div>
-            <strong>Machine Classes / Recipes</strong>
-            <div class="footnote">All recipe item references use dropdown selection only. Output rate and craft time stay synchronized on commit.</div>
+            <strong>Machine Classes</strong>
+            <div class="footnote">Machine classes contain only machine name and power usage at 100% clock.</div>
           </div>
-          <button type="button" class="secondary" data-action="add-recipe">Add Machine Class</button>
         </div>
-        <div class="recipes-grid">
-          ${state.recipes.map((recipe) => {
-            const analysis = summary.recipes.analyses.find((entry) => entry.id === recipe.id);
-            return `
-              <div class="recipe-card">
-                <div class="recipe-meta">
-                  <div><label class="field-label">Machine class name</label><input type="text" value="${escapeHtml(recipe.name)}" placeholder="Smelter, Refinery, Mixer..." data-recipe-field="name" data-recipe-id="${recipe.id}"></div>
-                  <div><label class="field-label">Output rate (item/min)</label><input type="text" value="${escapeHtml(recipe.outputRate)}" data-recipe-field="outputRate" data-recipe-id="${recipe.id}"></div>
-                  <div><label class="field-label">Craft time (sec)</label><input type="text" value="${escapeHtml(recipe.craftTime)}" data-recipe-field="craftTime" data-recipe-id="${recipe.id}"></div>
+        <div class="stack">
+          ${state.machineClassRows.map((row, index) => `
+            <div class="item-row ${machineStatuses.get(row.id)?.valid ? "valid" : ""}">
+              <div class="row cols-2">
+                <div>
+                  <label class="field-label">Machine name</label>
+                  <input type="text" value="${escapeHtml(row.name)}" data-machine-field="name" data-machine-id="${row.id}">
                 </div>
-                <div class="recipe-meta" style="grid-template-columns:1fr 1fr auto">
-                  <div><label class="field-label">Power at 100% clock</label><input type="text" value="${escapeHtml(recipe.power)}" data-recipe-field="power" data-recipe-id="${recipe.id}"></div>
-                  <div class="mini-summary">
-                    <strong>${analysis?.valid ? escapeHtml(analysis.name) : "Machine summary"}</strong><br>
-                    ${analysis?.valid ? `${analysis.machineCount} machine(s) - ${fmt(analysis.clock)}% - ${fmt(analysis.actualOutput)} item/min` : "Waiting for valid IO and rate data."}
-                  </div>
-                  <div><button type="button" class="secondary" data-remove-recipe="${recipe.id}">Remove</button></div>
+                <div>
+                  <label class="field-label">Power usage at 100%</label>
+                  <input type="text" value="${escapeHtml(row.power)}" data-machine-field="power" data-machine-id="${row.id}">
                 </div>
-                <div class="recipe-zones">
-                  <div>
-                    <label class="field-label">Inputs per craft</label>
-                    <div class="recipe-io-list">
-                      ${recipe.inputs.map((row) => `
-                        <div class="io-row">
-                          <select data-recipe-io="item" data-io-kind="input" data-recipe-id="${recipe.id}" data-io-id="${row.id}">
-                            <option value="">Select input item</option>
-                            ${recipeInputItems.map((item) => `<option value="${item.id}" ${item.id === row.itemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
-                          </select>
-                          <input type="text" value="${escapeHtml(row.qty)}" placeholder="Qty/craft" data-recipe-io="qty" data-io-kind="input" data-recipe-id="${recipe.id}" data-io-id="${row.id}">
-                        </div>
-                      `).join("")}
-                    </div>
-                  </div>
-                  <div>
-                    <label class="field-label">Outputs per craft</label>
-                    <div class="recipe-io-list">
-                      ${recipe.outputs.map((row) => `
-                        <div class="io-row">
-                          <select data-recipe-io="item" data-io-kind="output" data-recipe-id="${recipe.id}" data-io-id="${row.id}">
-                            <option value="">Select output item</option>
-                            ${recipeOutputItems.map((item) => `<option value="${item.id}" ${item.id === row.itemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
-                          </select>
-                          <input type="text" value="${escapeHtml(row.qty)}" placeholder="Qty/craft" data-recipe-io="qty" data-io-kind="output" data-recipe-id="${recipe.id}" data-io-id="${row.id}">
-                        </div>
-                      `).join("")}
-                    </div>
-                  </div>
-                </div>
-                ${analysis?.warnings?.length ? `<div class="summary-list" style="margin-top:10px">${analysis.warnings.map((warning) => `<div class="mini-summary warning-text">${escapeHtml(warning)}</div>`).join("")}</div>` : ""}
               </div>
-            `;
-          }).join("")}
-        </div>
-      </section>
-
-      <section class="process-shell">
-        <div class="process-header">
-          <div>
-            <strong>Process Line / Graph Definition</strong>
-            <div class="footnote">Rows auto-expand when valid. Merge edges on the board are directly deletable.</div>
-          </div>
-        </div>
-        <div class="process-list">
-          ${state.processRows.map((row) => `
-            <div class="process-row">
-              <select data-process-field="input" data-process-id="${row.id}">
-                <option value="">Select input item</option>
-                ${processInputItems.map((item) => `<option value="${item.id}" ${item.id === row.inputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
-              </select>
-              <div class="arrow-text">-&gt;</div>
-              <select data-process-field="output" data-process-id="${row.id}">
-                <option value="">Select output item</option>
-                ${processOutputItems.map((item) => `<option value="${item.id}" ${item.id === row.outputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
-              </select>
+              <div class="footnote">
+                ${machineStatuses.get(row.id)?.valid
+                  ? `Registered as <strong>${escapeHtml(row.name.trim())}</strong>.`
+                  : index === state.machineClassRows.length - 1
+                    ? "Leave one empty row available for the next machine class."
+                    : "Machine class names must be unique and power must be numeric."}
+              </div>
             </div>
           `).join("")}
         </div>
       </section>
 
+      <section class="recipes-shell">
+        <div class="recipes-header">
+          <div>
+            <strong>Recipes</strong>
+            <div class="footnote">Recipes are edited only through the modal editor. Duplicate recipes are highlighted in yellow and ignored after the first instance.</div>
+          </div>
+        </div>
+        <div class="recipe-card-list">
+          ${state.recipes.length ? state.recipes.map((recipe) => {
+            const outputItem = items.find((item) => item.id === recipe.outputItemId);
+            const machine = machineClasses.find((entry) => entry.id === recipe.machineClassId);
+            return `
+              <div class="recipe-card ${duplicateRecipes.has(recipe.id) ? "recipe-card-duplicate" : ""}">
+                <div class="stat-row">
+                  <div><strong>${escapeHtml(outputItem?.name || "Missing output")}</strong></div>
+                  <div class="value">${escapeHtml(machine?.name || "Missing machine")}</div>
+                </div>
+                <div class="stat-row">
+                  <div>${escapeHtml(fmt(parseNumber(recipe.itemsPerMinute) || 0))} item/min</div>
+                  <div class="value">${escapeHtml(fmt(parseNumber(recipe.outputQty) || 0))} / craft</div>
+                </div>
+                <div class="recipe-card-actions">
+                  <button type="button" class="secondary" data-edit-recipe="${recipe.id}">Edit</button>
+                </div>
+              </div>
+            `;
+          }).join("") : `<div class="mini-summary">No recipes defined yet.</div>`}
+        </div>
+        <div style="margin-top:10px">
+          <button type="button" data-action="add-recipe">+ Add Recipe</button>
+        </div>
+      </section>
+
       <div class="summary-strip">
         <div class="mini-summary">
-          <h4>Split Feasibility</h4>
-          ${summary.graph.splitAnalyses.length
-            ? summary.graph.splitAnalyses.map((entry) => `<div class="footnote ${entry.exact ? "ok-text" : "warning-text"}">${escapeHtml(entry.itemName)}: ${entry.outputs} outputs, ${entry.exact ? "exact" : `approx, delta ${fmt(entry.imbalance)} /min`}</div>`).join("")
-            : `<div class="footnote">No active split points.</div>`}
+          <h4>Machine Plan</h4>
+          ${solution.machinePlans.length
+            ? solution.machinePlans.map((plan) => `<div class="footnote">${escapeHtml(plan.outputItemName)}: ${plan.machineCount}x ${escapeHtml(plan.machineName)} at ${fmt(plan.clock)}%</div>`).join("")
+            : `<div class="footnote">No machine requirements yet.</div>`}
         </div>
         <div class="mini-summary">
-          <h4>Merge Feasibility</h4>
-          ${summary.graph.mergeAnalyses.length
-            ? summary.graph.mergeAnalyses.map((entry) => `<div class="footnote ${entry.exact ? "ok-text" : "warning-text"}">${escapeHtml(entry.itemName)}: ${entry.inputs} inputs, ${entry.exact ? "exact" : "approximate"}</div>`).join("")
-            : `<div class="footnote">No active merges.</div>`}
+          <h4>External Demand</h4>
+          ${solution.externalDemand && solution.externalDemand.size
+            ? [...solution.externalDemand.entries()].map(([itemId, demand]) => `<div class="footnote">${escapeHtml(solution.roleState.itemMap.get(itemId)?.name || "Unknown")}: ${fmt(demand)} /min</div>`).join("")
+            : `<div class="footnote">No external demand yet.</div>`}
         </div>
         <div class="mini-summary">
-          <h4>Machine Requirements</h4>
-          ${summary.recipes.analyses.length
-            ? summary.recipes.analyses.map((entry) => `<div class="footnote ${entry.valid ? "" : "warning-text"}">${escapeHtml(entry.name)}: ${entry.valid ? `${entry.machineCount} machine(s), ${fmt(entry.clock)}%` : "incomplete"}</div>`).join("")
-            : `<div class="footnote">No machine classes defined.</div>`}
+          <h4>Overflow Belts</h4>
+          ${solution.overflowBelts.length
+            ? solution.overflowBelts.map((belt) => `<div class="footnote">Belt ${belt.id}: ${escapeHtml(belt.itemName)} ${fmt(belt.rate)} /min</div>`).join("")
+            : `<div class="footnote">No overflow belts assigned.</div>`}
         </div>
         <div class="mini-summary">
-          <h4>Bottlenecks</h4>
-          ${summary.recipes.analyses.filter((entry) => entry.bottleneck).length
-            ? summary.recipes.analyses.filter((entry) => entry.bottleneck).map((entry) => `<div class="footnote warning-text">${escapeHtml(entry.name)} limited by ${escapeHtml(entry.bottleneck.itemName)}</div>`).join("")
-            : `<div class="footnote">No input bottlenecks detected for current recipe requests.</div>`}
+          <h4>Duplicates</h4>
+          ${solution.duplicateIds.size
+            ? `<div class="footnote warning-text">${solution.duplicateIds.size} duplicate recipe card(s) ignored after the first matching instance.</div>`
+            : `<div class="footnote">No duplicate recipes detected.</div>`}
         </div>
       </div>
     </div>
@@ -1561,20 +1496,17 @@ function render() {
     <section class="board-shell">
       <div class="board-header">
         <div>
-          <strong>Visual Board</strong>
-          <div class="footnote">SVG network view. Merge-created edges are hover-highlighted in red and delete immediately on click.</div>
-        </div>
-        <div class="toolbar-right">
-          <span class="pill">${summary.graph.exactRouting ? "Exact topology" : "Balanced approximation active"}</span>
-          <span class="pill">${summary.graph.edges.length} routed lines</span>
+          <strong>Solver Board</strong>
+          <div class="footnote">Automatically derived dependency chain for the current target output.</div>
         </div>
       </div>
-      <div class="board-stage">${renderBoard(summary)}</div>
+      <div class="board-stage">${renderSolverBoard(solution)}</div>
     </section>
   `;
 
   attachEvents();
   renderColorPicker();
+  renderRecipeModal();
 }
 
 function commitSettings(normalizeStrings = true) {
@@ -1588,6 +1520,8 @@ function commitSettings(normalizeStrings = true) {
     state.settings.mergerSizes = formatListNumbers(parseListNumbers(state.settings.mergerSizes, true));
     const maxPower = parseNumber(state.settings.maxPower);
     state.settings.maxPower = maxPower === null ? "" : normalizeNumericString(String(maxPower), 4);
+    const targetRate = parseNumber(state.settings.targetOutputRate);
+    state.settings.targetOutputRate = targetRate === null ? "" : normalizeNumericString(String(targetRate), 4);
   }
 }
 
@@ -1598,39 +1532,14 @@ function syncClockSliderUi(container = document) {
   const maxInput = container.querySelector('[data-setting="clockMax"]');
   const fill = container.querySelector(".dual-slider-fill");
   if (!minSlider || !maxSlider || !minInput || !maxInput || !fill) return;
-
-  const minSliderValue = getClockSliderValue(state.settings.clockMin);
-  const maxSliderValue = Math.max(minSliderValue, getClockSliderValue(state.settings.clockMax));
-
-  minSlider.value = String(minSliderValue);
-  maxSlider.value = String(maxSliderValue);
-
-  const sliderLeft = ((minSliderValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
-  const sliderRight = ((maxSliderValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
-  fill.style.left = `${sliderLeft}%`;
-  fill.style.right = `${100 - sliderRight}%`;
-}
-
-function commitRecipeField(recipe, field) {
-  if (field === "name") {
-    recipe.name = recipe.name.trimStart();
-    return;
-  }
-  if (field === "power") {
-    recipe.power = normalizeNumericString(recipe.power, 6);
-    return;
-  }
-  if (field === "outputRate") {
-    recipe.outputRate = normalizeNumericString(recipe.outputRate, 6);
-    recipe.syncSource = "rate";
-    syncRecipePair(recipe);
-    return;
-  }
-  if (field === "craftTime") {
-    recipe.craftTime = normalizeNumericString(recipe.craftTime, 6);
-    recipe.syncSource = "time";
-    syncRecipePair(recipe);
-  }
+  const minValue = getClockSliderValue(state.settings.clockMin);
+  const maxValue = Math.max(minValue, getClockSliderValue(state.settings.clockMax));
+  minSlider.value = String(minValue);
+  maxSlider.value = String(maxValue);
+  const left = ((minValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
+  const right = ((maxValue - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
+  fill.style.left = `${left}%`;
+  fill.style.right = `${100 - right}%`;
 }
 
 function attachEvents() {
@@ -1642,42 +1551,104 @@ function attachEvents() {
       const row = state.itemRows.find((entry) => entry.id === button.dataset.itemRandom);
       if (!row) return;
       row.color = randomVisibleColor();
-      ensureTrailingStructures();
+      ensureStateStructure();
       render();
     };
   });
+
+  app.querySelectorAll("[data-item-picker]").forEach((button) => {
+    button.onclick = () => openColorPicker(button.dataset.itemPicker, "color");
+  });
+
   app.querySelectorAll("[data-item-field]").forEach((input) => {
     input.oninput = (event) => {
       const row = state.itemRows.find((entry) => entry.id === input.dataset.itemId);
-      if (row) row[input.dataset.itemField] = event.target.value;
+      if (!row) return;
+      row[input.dataset.itemField] = event.target.value;
     };
-    input.onblur = () => { ensureTrailingStructures(); render(); };
-    input.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); event.target.blur(); } };
+    input.onblur = () => {
+      ensureStateStructure();
+      render();
+    };
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+      }
+    };
   });
+
   app.querySelectorAll("[data-belt-item]").forEach((input) => {
     input.onchange = (event) => {
       const row = state.itemRows.find((entry) => entry.id === input.dataset.beltItem);
       const belt = row?.belts.find((entry) => entry.id === input.dataset.beltId);
-      if (!belt || !row) return;
+      if (!row || !belt) return;
+      if (event.target.value === "__ONLY_OUTPUT__") {
+        row.belts = [emptyBeltRow()];
+        render();
+        return;
+      }
       belt.value = event.target.value;
       ensureTrailingBelts(row);
       render();
     };
   });
-  app.querySelectorAll("[data-item-picker]").forEach((button) => {
-    button.onclick = () => {
-      openColorPicker(button.dataset.itemPicker, "color");
+
+  app.querySelectorAll("[data-machine-field]").forEach((input) => {
+    input.oninput = (event) => {
+      const row = state.machineClassRows.find((entry) => entry.id === input.dataset.machineId);
+      if (row) row[input.dataset.machineField] = event.target.value;
+    };
+    input.onblur = () => {
+      const row = state.machineClassRows.find((entry) => entry.id === input.dataset.machineId);
+      if (row && input.dataset.machineField === "power") row.power = normalizeNumericString(row.power, 4);
+      ensureStateStructure();
+      render();
+    };
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+      }
     };
   });
+
+  app.querySelectorAll("[data-edit-recipe]").forEach((button) => {
+    button.onclick = () => openRecipeModal(button.dataset.editRecipe);
+  });
+
+  app.querySelectorAll("[data-action='add-recipe']").forEach((button) => {
+    button.onclick = () => openRecipeModal();
+  });
+
   app.querySelectorAll("[data-setting]").forEach((input) => {
-    input.oninput = (event) => { state.settings[input.dataset.setting] = event.target.value; };
+    input.oninput = (event) => {
+      state.settings[input.dataset.setting] = event.target.value;
+    };
+    input.onchange = (event) => {
+      state.settings[input.dataset.setting] = event.target.value;
+      if (input.tagName === "SELECT") render();
+    };
     input.onblur = () => {
       commitSettings();
       sanitizeBeltSelections(state);
       render();
     };
-    input.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); event.target.blur(); } };
+    input.onkeydown = (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+      }
+    };
   });
+
+  app.querySelectorAll("[data-setting-check]").forEach((input) => {
+    input.onchange = (event) => {
+      state.settings[input.dataset.settingCheck] = event.target.checked;
+      render();
+    };
+  });
+
   app.querySelectorAll("[data-clock-slider]").forEach((input) => {
     input.step = String(CLOCK_STEP);
     input.onpointerdown = (event) => {
@@ -1687,105 +1658,19 @@ function attachEvents() {
       const value = getClockSliderValue(event.target.value);
       const currentMin = getClockSliderValue(state.settings.clockMin);
       const currentMax = getClockSliderValue(state.settings.clockMax);
-      if (event.target.dataset.clockSlider === "min") {
-        state.settings.clockMin = String(Math.min(value, currentMax));
-      } else {
-        state.settings.clockMax = String(Math.max(value, currentMin));
-      }
+      if (event.target.dataset.clockSlider === "min") state.settings.clockMin = String(Math.min(value, currentMax));
+      else state.settings.clockMax = String(Math.max(value, currentMin));
       syncClockSliderUi(app);
       const minInput = app.querySelector('[data-setting="clockMin"]');
       const maxInput = app.querySelector('[data-setting="clockMax"]');
-      if (minInput && maxInput) {
-        minInput.value = String(getClockSliderValue(state.settings.clockMin));
-        maxInput.value = String(getClockSliderValue(state.settings.clockMax));
-      }
+      if (minInput) minInput.value = String(getClockSliderValue(state.settings.clockMin));
+      if (maxInput) maxInput.value = String(getClockSliderValue(state.settings.clockMax));
     };
-    input.onpointerup = (event) => {
-      if (typeof input.releasePointerCapture === "function" && input.hasPointerCapture?.(event.pointerId)) {
-        input.releasePointerCapture(event.pointerId);
-      }
-      render();
-    };
-    input.onpointercancel = (event) => {
-      if (typeof input.releasePointerCapture === "function" && input.hasPointerCapture?.(event.pointerId)) {
-        input.releasePointerCapture(event.pointerId);
-      }
-      render();
-    };
-    input.onchange = () => {
-      syncClockSliderUi(app);
-      render();
-    };
+    input.onpointerup = () => render();
+    input.onpointercancel = () => render();
+    input.onchange = () => render();
   });
-  app.querySelectorAll("[data-recipe-field]").forEach((input) => {
-    input.oninput = (event) => {
-      const recipe = state.recipes.find((entry) => entry.id === input.dataset.recipeId);
-      if (recipe) recipe[input.dataset.recipeField] = event.target.value;
-    };
-    input.onblur = () => {
-      const recipe = state.recipes.find((entry) => entry.id === input.dataset.recipeId);
-      if (!recipe) return;
-      commitRecipeField(recipe, input.dataset.recipeField);
-      render();
-    };
-    input.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); event.target.blur(); } };
-  });
-  app.querySelectorAll("[data-recipe-io]").forEach((input) => {
-    input.oninput = (event) => {
-      const recipe = state.recipes.find((entry) => entry.id === input.dataset.recipeId);
-      if (!recipe) return;
-      const list = input.dataset.ioKind === "input" ? recipe.inputs : recipe.outputs;
-      const row = list.find((entry) => entry.id === input.dataset.ioId);
-      if (!row) return;
-      if (input.dataset.recipeIo === "item") row.itemId = event.target.value;
-      else row.qty = event.target.value;
-    };
-    input.onchange = () => {
-      const recipe = state.recipes.find((entry) => entry.id === input.dataset.recipeId);
-      if (!recipe) return;
-      if (input.dataset.recipeIo === "qty") {
-        const list = input.dataset.ioKind === "input" ? recipe.inputs : recipe.outputs;
-        const row = list.find((entry) => entry.id === input.dataset.ioId);
-        if (row) row.qty = normalizeNumericString(row.qty, 6);
-      }
-      ensureTrailingIoRows(recipe.inputs, "rin");
-      ensureTrailingIoRows(recipe.outputs, "rout");
-      syncRecipePair(recipe);
-      render();
-    };
-    input.onblur = input.onchange;
-    input.onkeydown = (event) => { if (event.key === "Enter") { event.preventDefault(); event.target.blur(); } };
-  });
-  app.querySelectorAll("[data-remove-recipe]").forEach((button) => {
-    button.onclick = () => {
-      state.recipes = state.recipes.filter((entry) => entry.id !== button.dataset.removeRecipe);
-      if (!state.recipes.length) state.recipes.push(emptyRecipe());
-      render();
-    };
-  });
-  app.querySelectorAll("[data-action='add-recipe']").forEach((button) => {
-    button.onclick = () => { state.recipes.push(emptyRecipe()); render(); };
-  });
-  app.querySelectorAll("[data-process-field]").forEach((select) => {
-    select.onchange = (event) => {
-      const row = state.processRows.find((entry) => entry.id === select.dataset.processId);
-      if (!row) return;
-      if (select.dataset.processField === "input") row.inputItemId = event.target.value;
-      else row.outputItemId = event.target.value;
-      ensureTrailingStructures();
-      render();
-    };
-  });
-  app.querySelectorAll("[data-delete-row]").forEach((target) => {
-    target.onclick = (event) => {
-      const rowId = event.target.dataset.deleteRow || target.dataset.deleteRow;
-      const row = state.processRows.find((entry) => entry.id === rowId);
-      if (!row) return;
-      row.outputItemId = "";
-      ensureTrailingStructures();
-      render();
-    };
-  });
+
   app.querySelectorAll("[data-action='save-json']").forEach((button) => {
     button.onclick = () => {
       const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
@@ -1797,7 +1682,11 @@ function attachEvents() {
       URL.revokeObjectURL(url);
     };
   });
-  app.querySelectorAll("[data-action='load-json']").forEach((button) => { button.onclick = () => fileInput.click(); });
+
+  app.querySelectorAll("[data-action='load-json']").forEach((button) => {
+    button.onclick = () => fileInput.click();
+  });
+
   if (fileInput) {
     fileInput.onchange = async (event) => {
       const file = event.target.files?.[0];
@@ -1805,6 +1694,8 @@ function attachEvents() {
       const text = await file.text();
       try {
         state = sanitizeState(JSON.parse(text));
+        closeRecipeModal();
+        closeColorPicker();
         render();
       } catch (error) {
         alert("Invalid JSON file.");
@@ -1813,12 +1704,18 @@ function attachEvents() {
       }
     };
   }
+
   app.querySelectorAll("[data-action='reset-all']").forEach((button) => {
-    button.onclick = () => { state = createDefaultState(); render(); };
+    button.onclick = () => {
+      state = createDefaultState();
+      closeRecipeModal();
+      closeColorPicker();
+      render();
+    };
   });
 
   syncClockSliderUi(app);
 }
 
-bindColorPickerGlobalEvents();
+bindGlobalEvents();
 render();
