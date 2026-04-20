@@ -2,6 +2,15 @@ const STORAGE_KEY = "flowforge-state-v2";
 const CLOCK_SLIDER_MIN = 0.01;
 const CLOCK_SLIDER_MAX = 100;
 const CLOCK_STEP = 1;
+const FIXED_ROUTING_SIZES = [2, 3];
+const ROUTING_NODE_RADIUS = 10;
+const ROUTING_NODE_DIAMETER = ROUTING_NODE_RADIUS * 2;
+const MACHINE_PORT_STEM = 28;
+const MACHINE_BASE_WIDTH = 170;
+const MACHINE_HEIGHT = 84;
+const BELT_MIN_WIDTH = 8;
+const BELT_LANE_SPACING = BELT_MIN_WIDTH * 2;
+const NODE_ARROW_PROTECTION = ROUTING_NODE_RADIUS + ROUTING_NODE_DIAMETER;
 
 const uid = (() => {
   let i = 1;
@@ -19,7 +28,7 @@ function emptyItemRow() {
 }
 
 function emptyMachineClassRow() {
-  return { id: uid("machine"), name: "", power: "" };
+  return { id: uid("machine"), name: "", power: "", inputCounts: "" };
 }
 
 function emptyRecipeInputRow() {
@@ -96,7 +105,8 @@ function sanitizeState(input) {
   next.machineClassRows = next.machineClassRows.map((row) => ({
     id: row.id || uid("machine"),
     name: String(row.name || ""),
-    power: String(row.power ?? "")
+    power: String(row.power ?? ""),
+    inputCounts: String(row.inputCounts ?? "")
   }));
 
   next.recipes = next.recipes.map((recipe) => ({
@@ -181,6 +191,17 @@ function formatListNumbers(values) {
   return values.map((value) => String(value)).join(", ");
 }
 
+function parseExactInputCounts(text) {
+  return String(text || "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => Number(part))
+    .filter((num) => Number.isInteger(num) && num > 0)
+    .filter((num, index, array) => array.indexOf(num) === index)
+    .sort((a, b) => a - b);
+}
+
 function parseListNumbers(text, integerOnly = false) {
   return String(text || "")
     .split(",")
@@ -228,8 +249,8 @@ function getClockSliderValue(value) {
 
 function getSettingsNumbers(targetState = state) {
   const beltSpeeds = getDefinedBeltSpeeds(targetState);
-  const splitterSizes = parseListNumbers(targetState.settings.splitterSizes, true);
-  const mergerSizes = parseListNumbers(targetState.settings.mergerSizes, true);
+  const splitterSizes = FIXED_ROUTING_SIZES.slice();
+  const mergerSizes = FIXED_ROUTING_SIZES.slice();
   const maxPower = parseNumber(targetState.settings.maxPower) ?? 0;
   const minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(targetState.settings.clockMin) ?? 1, CLOCK_SLIDER_MAX));
   const maxClock = 100;
@@ -422,9 +443,10 @@ function hideFactoryTooltip() {
 function showFactoryTooltip(text, clientX, clientY) {
   const root = ensureFactoryTooltipRoot();
   root.textContent = text;
-  root.style.left = `${clientX + 14}px`;
-  root.style.top = `${clientY + 14}px`;
   root.classList.add("visible");
+  const width = root.offsetWidth || 0;
+  root.style.left = `${Math.max(8, clientX - width - 14)}px`;
+  root.style.top = `${clientY + 16}px`;
 }
 
 function bindFactoryTooltipEvents() {
@@ -485,7 +507,7 @@ function ensureItemRows(targetState = state) {
 }
 
 function getMachineClassStatuses(targetState = state) {
-  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim());
+  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim() || row.inputCounts.trim());
   const nameCounts = new Map();
   meaningfulRows.forEach((row) => {
     const key = row.name.trim().toLowerCase();
@@ -496,16 +518,17 @@ function getMachineClassStatuses(targetState = state) {
   targetState.machineClassRows.forEach((row) => {
     const key = row.name.trim().toLowerCase();
     const power = parseNumber(row.power);
+    const allowedInputCounts = parseExactInputCounts(row.inputCounts);
     statuses.set(row.id, {
-      empty: !row.name.trim() && !row.power.trim(),
-      valid: Boolean(key && nameCounts.get(key) === 1 && power !== null && power > 0)
+      empty: !row.name.trim() && !row.power.trim() && !row.inputCounts.trim(),
+      valid: Boolean(key && nameCounts.get(key) === 1 && power !== null && power > 0 && allowedInputCounts.length > 0)
     });
   });
   return statuses;
 }
 
 function ensureMachineClassRows(targetState = state) {
-  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim());
+  const meaningfulRows = targetState.machineClassRows.filter((row) => row.name.trim() || row.power.trim() || row.inputCounts.trim());
   const statuses = getMachineClassStatuses({ ...targetState, machineClassRows: meaningfulRows });
   const trimmed = [];
   for (const row of meaningfulRows) {
@@ -590,7 +613,12 @@ function getDefinedMachineClasses(targetState = state) {
   const statuses = getMachineClassStatuses(targetState);
   return targetState.machineClassRows
     .filter((row) => statuses.get(row.id)?.valid)
-    .map((row) => ({ id: row.id, name: row.name.trim(), power: parseNumber(row.power) || 0 }));
+    .map((row) => ({
+      id: row.id,
+      name: row.name.trim(),
+      power: parseNumber(row.power) || 0,
+      allowedInputCounts: parseExactInputCounts(row.inputCounts)
+    }));
 }
 
 function getDefinedBeltSpeeds(targetState = state) {
@@ -630,9 +658,7 @@ function sanitizeRecipe(recipe) {
 
 function createRecipeDraft(recipe = emptyRecipe()) {
   const next = sanitizeRecipe(recipe);
-  const filledInputs = next.inputs.filter((row) => row.itemId || row.qty !== "");
-  next.inputs = filledInputs.length ? filledInputs : [emptyRecipeInputRow()];
-  ensureDraftInputRows(next);
+  syncDraftInputRowsToMachine(next);
   return next;
 }
 
@@ -641,14 +667,21 @@ function isDraftInputRowValid(row) {
   return Boolean(row.itemId && qty !== null && qty > 0);
 }
 
-function ensureDraftInputRows(draft) {
-  const meaningful = draft.inputs.filter((row) => row.itemId || row.qty !== "");
-  if (!meaningful.length) {
-    draft.inputs = [emptyRecipeInputRow()];
-    return;
-  }
-  draft.inputs = meaningful;
-  if (isDraftInputRowValid(meaningful[meaningful.length - 1])) draft.inputs.push(emptyRecipeInputRow());
+function getDraftMaxInputRows(draft, targetState = state) {
+  const machineClass = getMachineClassMap(targetState).get(draft.machineClassId);
+  if (!machineClass?.allowedInputCounts?.length) return 1;
+  return Math.max(...machineClass.allowedInputCounts);
+}
+
+function syncDraftInputRowsToMachine(draft, targetState = state) {
+  const rowCount = getDraftMaxInputRows(draft, targetState);
+  const existing = Array.isArray(draft.inputs) ? draft.inputs.slice(0, rowCount) : [];
+  while (existing.length < rowCount) existing.push(emptyRecipeInputRow());
+  draft.inputs = existing.map((row) => ({
+    id: row.id || uid("rin"),
+    itemId: String(row.itemId || ""),
+    qty: String(row.qty ?? "")
+  }));
 }
 
 function getDraftDuplicateInputIds(draft) {
@@ -664,23 +697,34 @@ function getRecipeValidation(draft, targetState = state) {
   const itemMap = getItemMap(targetState);
   const machineMap = getMachineClassMap(targetState);
   const duplicateInputIds = getDraftDuplicateInputIds(draft);
+  const filledInputCount = draft.inputs.filter((row) => row.itemId && parseNumber(row.qty) !== null && parseNumber(row.qty) > 0).length;
   const validInputs = draft.inputs
     .map((row) => ({ ...row, qtyNum: parseNumber(row.qty) }))
     .filter((row) => row.itemId && itemMap.has(row.itemId) && row.qtyNum !== null && row.qtyNum > 0);
   const outputQty = parseNumber(draft.outputQty);
   const itemsPerMinute = parseNumber(draft.itemsPerMinute);
+  const machineClass = machineMap.get(draft.machineClassId);
+  const inputCountAllowed = Boolean(machineClass && machineClass.allowedInputCounts.includes(filledInputCount));
+  const incompleteFilledRows = draft.inputs.some((row) => {
+    const hasItem = Boolean(row.itemId);
+    const qty = parseNumber(row.qty);
+    const hasQty = qty !== null && qty > 0;
+    return hasItem !== hasQty;
+  });
   const valid =
     validInputs.length > 0 &&
     duplicateInputIds.size === 0 &&
+    !incompleteFilledRows &&
     draft.outputItemId &&
     itemMap.has(draft.outputItemId) &&
     outputQty !== null &&
     outputQty > 0 &&
     draft.machineClassId &&
     machineMap.has(draft.machineClassId) &&
+    inputCountAllowed &&
     itemsPerMinute !== null &&
     itemsPerMinute > 0;
-  return { valid, validInputs, duplicateInputIds };
+  return { valid, validInputs, duplicateInputIds, inputCountAllowed, filledInputCount, incompleteFilledRows };
 }
 
 function recipeSignature(recipe) {
@@ -1111,8 +1155,19 @@ function makeOrthogonalSegments(points) {
   return segments;
 }
 
+function applyEndpointProtection(segments, startProtect = 0, endProtect = 0) {
+  if (!segments.length) return segments;
+  if (startProtect > 0) segments[0].noArrowStart = Math.max(segments[0].noArrowStart || 0, startProtect);
+  if (endProtect > 0) segments[segments.length - 1].noArrowEnd = Math.max(segments[segments.length - 1].noArrowEnd || 0, endProtect);
+  return segments;
+}
+
 function segmentIsHorizontal(segment) {
   return segment.y1 === segment.y2;
+}
+
+function segmentIsVertical(segment) {
+  return segment.x1 === segment.x2;
 }
 
 function segmentLength(segment) {
@@ -1251,15 +1306,20 @@ function openArrowPath(x, y, direction, size = 7) {
 
 function renderArrowHeadsForSegment(segment, speedColor, overpass) {
   const length = segmentLength(segment);
-  if (length < 8) return "";
+  const startPadding = Math.max(0, segment.noArrowStart || 0);
+  const endPadding = Math.max(0, segment.noArrowEnd || 0);
+  const usableLength = length - startPadding - endPadding;
+  if (usableLength < 8) return "";
   const direction = segmentDirection(segment);
   const contrast = contrastColor(speedColor);
   const spacing = 42;
-  const count = Math.max(1, Math.floor(length / spacing));
+  const count = Math.max(1, Math.floor(usableLength / spacing));
   const arrows = [];
   for (let index = 1; index <= count; index += 1) {
-    const preferredOffset = count === 1 ? length / 2 : index * spacing;
-    const offset = Math.max(8, Math.min(length - 8, preferredOffset));
+    const preferredOffset = count === 1
+      ? startPadding + usableLength / 2
+      : startPadding + (usableLength * index) / (count + 1);
+    const offset = Math.max(startPadding + 8, Math.min(length - endPadding - 8, preferredOffset));
     const x = segment.x1 === segment.x2
       ? segment.x1
       : (segment.x2 > segment.x1 ? segment.x1 + offset : segment.x1 - offset);
@@ -1299,7 +1359,65 @@ function renderFactoryNodeLabel(x, y, title, subtitle) {
 
 function renderRoutingNode(x, y, color, tooltip = "") {
   const tooltipAttr = tooltip ? ` data-factory-tooltip="${escapeHtml(tooltip)}"` : "";
-  return `<circle cx="${x}" cy="${y}" r="10" fill="${color}" stroke="rgba(60,48,31,0.8)" stroke-width="2"${tooltipAttr}></circle>`;
+  return `<circle cx="${x}" cy="${y}" r="${ROUTING_NODE_RADIUS}" fill="${color}" stroke="rgba(60,48,31,0.8)" stroke-width="2"${tooltipAttr}></circle>`;
+}
+
+function getSplitterPorts(x, y, branchCount) {
+  if (branchCount === 2) {
+    return {
+      input: { x, y },
+      inputKind: "bottom",
+      outputs: [
+        { point: { x, y }, kind: "side" },
+        { point: { x, y }, kind: "side" }
+      ]
+    };
+  }
+  return {
+    input: { x, y },
+    inputKind: "bottom",
+    outputs: [
+      { point: { x, y }, kind: "side" },
+      { point: { x, y }, kind: "side" },
+      { point: { x, y }, kind: "top" }
+    ]
+  };
+}
+
+function getMergerPorts(x, y, branchCount) {
+  if (branchCount === 2) {
+    return {
+      inputs: [
+        { point: { x, y }, kind: "side" },
+        { point: { x, y }, kind: "side" }
+      ],
+      output: { point: { x, y }, kind: "top" }
+    };
+  }
+  return {
+    inputs: [
+      { point: { x, y }, kind: "side" },
+      { point: { x, y }, kind: "side" },
+      { point: { x, y }, kind: "bottom" }
+    ],
+    output: { point: { x, y }, kind: "top" }
+  };
+}
+
+function computeMachineWidth(inputCount) {
+  const safeCount = Math.max(1, inputCount || 1);
+  const edgePadding = BELT_MIN_WIDTH;
+  const minSegmentWidth = BELT_LANE_SPACING;
+  return Math.max(MACHINE_BASE_WIDTH, edgePadding * 2 + safeCount * minSegmentWidth);
+}
+
+function getMachineInputSlotXs(centerX, machineWidth, inputCount) {
+  if (inputCount <= 1) return [centerX];
+  const edgePadding = BELT_MIN_WIDTH;
+  const usableWidth = machineWidth - edgePadding * 2;
+  const segmentWidth = usableWidth / inputCount;
+  const left = centerX - machineWidth / 2 + edgePadding;
+  return Array.from({ length: inputCount }, (_, index) => left + segmentWidth * (index + 0.5));
 }
 
 function findExactFactorChain(target, allowedSizes) {
@@ -1337,6 +1455,30 @@ function partitionTargets(targets, groups) {
 function routeHV(start, end) {
   if (start.x === end.x || start.y === end.y) return [start, end];
   return [start, { x: end.x, y: start.y }, end];
+}
+
+function compressPoints(points) {
+  const compressed = [];
+  points.forEach((point) => {
+    const last = compressed[compressed.length - 1];
+    if (last && last.x === point.x && last.y === point.y) return;
+    compressed.push(point);
+  });
+  return compressed;
+}
+
+function routeIntoPort(start, port, kind) {
+  if (kind === "side") {
+    return compressPoints([start, { x: start.x, y: port.y }, port]);
+  }
+  return compressPoints([start, { x: port.x, y: start.y }, port]);
+}
+
+function routeOutOfPort(port, end, kind) {
+  if (kind === "side") {
+    return compressPoints([port, { x: end.x, y: port.y }, end]);
+  }
+  return compressPoints([port, { x: port.x, y: end.y }, end]);
 }
 
 function extendBounds(bounds, x, y) {
@@ -1386,11 +1528,10 @@ function renderSolverBoard(solution) {
   const maxLevel = Math.max(...layouts.map((entry) => entry.level));
   const width = Math.max(1200, 280 + Math.max(...layouts.map((entry) => entry.x)));
   const height = Math.max(560, 220 + (maxLevel + 1) * 230);
-  const machineWidth = 170;
-  const machineHeight = 84;
-  const sourceRadius = 20;
+  const machineHeight = MACHINE_HEIGHT;
   const topMargin = 170;
   const levelGap = 220;
+  const machineNodeGap = ROUTING_NODE_DIAMETER;
   const positions = new Map();
   layouts.forEach((entry) => {
     positions.set(entry.node, {
@@ -1402,24 +1543,30 @@ function renderSolverBoard(solution) {
   const belts = [];
   const outputBelts = [];
   const renderedNodes = [];
+  const routingNodeMeta = [];
   const planByRecipeId = new Map(solution.machinePlans.map((plan) => [plan.recipeId, plan]));
   const layoutBounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
 
-  function addBelt(collection, itemColor, rate, points, itemName = "") {
+  function addBelt(collection, itemColor, rate, points, itemName = "", startProtect = 0, endProtect = 0) {
     const beltSpeed = chooseBeltSpeedForRate(rate, beltSpeeds);
     collection.push({
       itemColor,
       speedColor: beltSpeed?.color || "#ffffff",
       tooltip: `${itemName || "Item"}\n${fmt(rate)} item/min`,
-      segments: makeOrthogonalSegments(points).map((segment) => ({ ...segment, strokeWidth: beltStrokeWidth(rate, beltSpeed) }))
+      segments: applyEndpointProtection(
+        makeOrthogonalSegments(points).map((segment) => ({ ...segment, strokeWidth: beltStrokeWidth(rate, beltSpeed) })),
+        startProtect,
+        endProtect
+      )
     });
     points.forEach((point) => extendBounds(layoutBounds, point.x, point.y));
   }
 
-  function addRoutingNode(x, y, color, tooltip) {
+  function addRoutingNode(x, y, color, tooltip, role = "", branchCount = 0) {
     renderedNodes.push(`<g class="factory-routing-node">${renderRoutingNode(x, y, color, tooltip)}</g>`);
-    extendBounds(layoutBounds, x - 12, y - 12);
-    extendBounds(layoutBounds, x + 12, y + 12);
+    routingNodeMeta.push({ x, y, role, branchCount });
+    extendBounds(layoutBounds, x - ROUTING_NODE_RADIUS - 2, y - ROUTING_NODE_RADIUS - 2);
+    extendBounds(layoutBounds, x + ROUTING_NODE_RADIUS + 2, y + ROUTING_NODE_RADIUS + 2);
   }
 
   function connectSplitterTree(startPoint, targetPoints, itemColor, totalRate, levelBaseY, itemName) {
@@ -1428,14 +1575,15 @@ function renderSolverBoard(solution) {
       return;
     }
 
-    const factors = findExactFactorChain(targetPoints.length, solution.settings.splitterSizes);
+    const factors = findExactFactorChain(targetPoints.length, FIXED_ROUTING_SIZES);
     if (!factors?.length) {
       const nodeX = targetPoints.reduce((sum, point) => sum + point.x, 0) / targetPoints.length;
       const nodeY = levelBaseY;
-      addBelt(belts, itemColor, totalRate, routeHV(startPoint, { x: nodeX, y: nodeY }), itemName);
+      const ports = getSplitterPorts(nodeX, nodeY, targetPoints.length);
+      addBelt(belts, itemColor, totalRate, routeIntoPort(startPoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION);
       const branchRate = totalRate / targetPoints.length;
-      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\nInput: ${fmt(totalRate)} item/min\nOutputs: ${targetPoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}`);
-      targetPoints.forEach((point) => addBelt(belts, itemColor, branchRate, routeHV({ x: nodeX, y: nodeY }, point), itemName));
+      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(totalRate)} item/min\n${itemName || "Item"} outputs: ${targetPoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}`, "splitter", targetPoints.length);
+      targetPoints.forEach((point, index) => addBelt(belts, itemColor, branchRate, routeOutOfPort(ports.outputs[index].point, point, ports.outputs[index].kind), itemName, NODE_ARROW_PROTECTION, 0));
       return;
     }
 
@@ -1449,13 +1597,14 @@ function renderSolverBoard(solution) {
       const nodeX = groups.reduce((sum, group) => sum + group.reduce((inner, point) => inner + point.x, 0) / group.length, 0) / groups.length;
       const nodeY = y;
       const inboundRate = totalRate * (points.length / targetPoints.length);
-      addBelt(belts, itemColor, inboundRate, routeHV(sourcePoint, { x: nodeX, y: nodeY }), itemName);
+      const ports = getSplitterPorts(nodeX, nodeY, factor);
+      addBelt(belts, itemColor, inboundRate, routeIntoPort(sourcePoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION);
       const nextY = y + 34;
       const childRate = inboundRate / factor;
-      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\nInput: ${fmt(inboundRate)} item/min\nOutputs: ${groups.map(() => `${fmt(childRate)} item/min`).join(", ")}`);
-      groups.forEach((group) => {
+      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(inboundRate)} item/min\n${itemName || "Item"} outputs: ${groups.map(() => `${fmt(childRate)} item/min`).join(", ")}`, "splitter", factor);
+      groups.forEach((group, groupIndex) => {
         const groupPoint = { x: group.reduce((sum, point) => sum + point.x, 0) / group.length, y: nodeY };
-        addBelt(belts, itemColor, childRate * group.length, [{ x: nodeX, y: nodeY }, { x: groupPoint.x, y: groupPoint.y }], itemName);
+        addBelt(belts, itemColor, childRate * group.length, routeOutOfPort(ports.outputs[groupIndex].point, groupPoint, ports.outputs[groupIndex].kind), itemName, NODE_ARROW_PROTECTION, 0);
         if (factorIndex === factors.length - 1) {
           group.forEach((point) => addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(groupPoint, point), itemName));
         } else {
@@ -1473,14 +1622,15 @@ function renderSolverBoard(solution) {
       return;
     }
 
-    const factors = findExactFactorChain(sourcePoints.length, solution.settings.mergerSizes)?.slice().reverse();
+    const factors = findExactFactorChain(sourcePoints.length, FIXED_ROUTING_SIZES)?.slice().reverse();
     if (!factors?.length) {
       const nodeX = sourcePoints.reduce((sum, point) => sum + point.x, 0) / sourcePoints.length;
       const nodeY = levelBaseY;
+      const ports = getMergerPorts(nodeX, nodeY, sourcePoints.length);
       const branchRate = totalRate / sourcePoints.length;
-      sourcePoints.forEach((point) => addBelt(outputBelts, itemColor, branchRate, routeHV(point, { x: nodeX, y: nodeY }), itemName));
-      addRoutingNode(nodeX, nodeY, itemColor, `Merger\nInputs: ${sourcePoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}\nOutput: ${fmt(totalRate)} item/min`);
-      addBelt(outputBelts, itemColor, totalRate, routeHV({ x: nodeX, y: nodeY }, targetPoint), itemName);
+      sourcePoints.forEach((point, index) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[index].point, ports.inputs[index].kind), itemName, 0, NODE_ARROW_PROTECTION));
+      addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${sourcePoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(totalRate)} item/min`, "merger", sourcePoints.length);
+      addBelt(outputBelts, itemColor, totalRate, routeOutOfPort(ports.output.point, targetPoint, ports.output.kind), itemName, NODE_ARROW_PROTECTION, 0);
       return;
     }
 
@@ -1495,10 +1645,11 @@ function renderSolverBoard(solution) {
         const group = currentPoints.slice(index * groupSize, (index + 1) * groupSize);
         const nodeX = group.reduce((sum, point) => sum + point.x, 0) / group.length;
         const nodeY = y;
+        const ports = getMergerPorts(nodeX, nodeY, group.length);
         const branchRate = totalRate / sourcePoints.length;
-        group.forEach((point) => addBelt(outputBelts, itemColor, branchRate, routeHV(point, { x: nodeX, y: nodeY }), itemName));
-        addRoutingNode(nodeX, nodeY, itemColor, `Merger\nInputs: ${group.map(() => `${fmt(branchRate)} item/min`).join(", ")}\nOutput: ${fmt(branchRate * group.length)} item/min`);
-        nextPoints.push({ x: nodeX, y: nodeY });
+        group.forEach((point, pointIndex) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[pointIndex].point, ports.inputs[pointIndex].kind), itemName, 0, NODE_ARROW_PROTECTION));
+        addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${group.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(branchRate * group.length)} item/min`, "merger", group.length);
+        nextPoints.push(ports.output.point);
       }
       currentPoints = nextPoints;
       y -= 34;
@@ -1516,7 +1667,7 @@ function renderSolverBoard(solution) {
       addBelt(outputBelts, itemColor, node.rate, [{ x: pos.x, y: sourceBottomY }, { x: pos.x, y: sourceTopY }], node.label);
       extendBounds(layoutBounds, pos.x - 80, pos.y - 24);
       extendBounds(layoutBounds, pos.x + 80, pos.y + 70);
-      return { outputX: pos.x, outputY: sourceTopY, itemColor, rate: node.rate };
+      return { outputX: pos.x, outputY: sourceTopY, itemColor, rate: node.rate, outputs: [{ x: pos.x, y: sourceTopY, rate: node.rate }] };
     }
 
     const machineCount = Math.max(1, node.machineCount || 1);
@@ -1524,28 +1675,59 @@ function renderSolverBoard(solution) {
     const instanceRates = node.instanceRates?.length ? node.instanceRates : [node.actualRate || node.requiredRate || 0];
     const instanceSpacing = 220;
     const machineCenters = Array.from({ length: machineCount }, (_, index) => pos.x + (index - (machineCount - 1) / 2) * instanceSpacing);
+    const machineWidth = computeMachineWidth(children.length || 1);
     const machineBottomY = pos.y + machineHeight / 2;
-    const inputPortY = machineBottomY + 18;
     const machineTopY = pos.y - machineHeight / 2;
-    const outputStartY = machineTopY - 18;
-    const outputTipY = outputStartY - 38;
+    const machineInputY = pos.y;
+    const machineOutputY = pos.y;
+    const outputTipY = machineTopY - MACHINE_PORT_STEM - machineNodeGap - 38;
     const outputItemColor = getNodeItemColor(node, itemMap);
     const inputColors = children.map((child) => getNodeItemColor(child, itemMap));
     const machineColor = averageHexColors([...inputColors, outputItemColor]);
     const machineTextColor = contrastColor(machineColor);
+    const machineInputSlots = machineCenters.map((centerX) => getMachineInputSlotXs(centerX, machineWidth, children.length || 1));
+    const machineArrowProtection = machineHeight / 2 + ROUTING_NODE_DIAMETER;
 
-    const splitterY = inputPortY + 46;
-    const mergerY = outputStartY - 28;
+    const splitterY = machineBottomY + machineNodeGap + 46;
+    const mergerY = machineTopY - machineNodeGap - 46;
 
     children.forEach((child, index) => {
       const childVisual = buildNodeVisuals(child);
-      const splitterX = pos.x + (index - (children.length - 1) / 2) * 52;
+      const directParallel =
+        machineCount > 1 &&
+        childVisual.outputs &&
+        childVisual.outputs.length === machineCount;
 
-      if (machineCount === 1) {
-        const targetX = machineCenters[0];
-        addBelt(belts, childVisual.itemColor, childVisual.rate, routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: inputPortY }), child.label);
+      if (directParallel) {
+        const orderedOutputs = [...childVisual.outputs].sort((a, b) => a.x - b.x);
+        orderedOutputs.forEach((output, outputIndex) => {
+          const targetX = machineInputSlots[outputIndex][index] ?? machineCenters[outputIndex];
+          addBelt(
+            belts,
+            childVisual.itemColor,
+            output.rate,
+            compressPoints(routeHV({ x: output.x, y: output.y }, { x: targetX, y: machineInputY })),
+            child.label,
+            0,
+            machineArrowProtection
+          );
+        });
+      } else if (machineCount === 1) {
+        const targetX = machineInputSlots[0][index] ?? machineCenters[0];
+        addBelt(
+          belts,
+          childVisual.itemColor,
+          childVisual.rate,
+          compressPoints(routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: machineInputY })),
+          child.label,
+          0,
+          machineArrowProtection
+        );
       } else {
-        const targetPoints = machineCenters.map((centerX) => ({ x: centerX, y: inputPortY }));
+        const targetPoints = machineCenters.map((centerX, machineIndex) => ({
+          x: machineInputSlots[machineIndex][index] ?? centerX,
+          y: machineInputY
+        }));
         connectSplitterTree(
           { x: childVisual.outputX, y: childVisual.outputY },
           targetPoints,
@@ -1560,9 +1742,13 @@ function renderSolverBoard(solution) {
     const outputRate = node.actualRate || node.requiredRate || 0;
 
     if (machineCount === 1) {
-      addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: outputStartY }, { x: machineCenters[0], y: outputTipY }], node.label);
+      addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: machineOutputY }, { x: machineCenters[0], y: outputTipY }], node.label, machineArrowProtection, 0);
     } else {
-      const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: outputStartY }));
+      const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: machineTopY - machineNodeGap }));
+      machineCenters.forEach((centerX, machineIndex) => {
+        const instanceRate = instanceRates[machineIndex] || 0;
+        addBelt(outputBelts, outputItemColor, instanceRate, [{ x: centerX, y: machineOutputY }, { x: centerX, y: machineTopY - machineNodeGap }], node.label, machineArrowProtection, 0);
+      });
       connectMergerTree(sourcePoints, { x: pos.x, y: outputTipY }, outputItemColor, outputRate, mergerY, node.label);
     }
 
@@ -1584,10 +1770,51 @@ function renderSolverBoard(solution) {
     extendBounds(layoutBounds, pos.x - 40, outputTipY - 12);
     extendBounds(layoutBounds, pos.x + 40, outputTipY);
 
-    return { outputX: pos.x, outputY: outputTipY, itemColor: outputItemColor, rate: outputRate };
+    return {
+      outputX: pos.x,
+      outputY: outputTipY,
+      itemColor: outputItemColor,
+      rate: outputRate,
+      outputs: machineCenters.map((centerX, machineIndex) => ({
+        x: centerX,
+        y: machineTopY - machineNodeGap,
+        rate: instanceRates[machineIndex] || 0
+      }))
+    };
   }
 
   buildNodeVisuals(solution.targetNode);
+  const pruneIllegalRoutingSegments = (collection) => {
+    collection.forEach((belt) => {
+      belt.segments = belt.segments.filter((segment) => {
+        if (!segmentIsVertical(segment)) return true;
+        return !routingNodeMeta.some((nodeMeta) => {
+          const touchesNodeX = Math.abs(segment.x1 - nodeMeta.x) < 0.01;
+          if (!touchesNodeX) return false;
+          if (nodeMeta.role === "splitter") {
+            const topPortY = nodeMeta.y - ROUTING_NODE_RADIUS;
+            if (nodeMeta.branchCount === 2) {
+              return Math.min(segment.y1, segment.y2) <= topPortY + 0.01 &&
+                Math.max(segment.y1, segment.y2) >= topPortY - 0.01 &&
+                Math.min(segment.y1, segment.y2) < nodeMeta.y;
+            }
+            return segmentDirection(segment) === "down" &&
+              Math.min(segment.y1, segment.y2) <= topPortY + 0.01 &&
+              Math.max(segment.y1, segment.y2) >= topPortY - 0.01;
+          }
+          if (nodeMeta.role === "merger" && nodeMeta.branchCount === 2) {
+            const bottomPortY = nodeMeta.y + ROUTING_NODE_RADIUS;
+            return segmentDirection(segment) === "up" &&
+              Math.min(segment.y1, segment.y2) <= bottomPortY + 0.01 &&
+              Math.max(segment.y1, segment.y2) >= bottomPortY - 0.01;
+          }
+          return false;
+        });
+      });
+    });
+  };
+  pruneIllegalRoutingSegments(belts);
+  pruneIllegalRoutingSegments(outputBelts);
   resolveParallelOverlaps(belts);
   resolveParallelOverlaps(outputBelts);
   markOverpasses(belts);
@@ -1806,6 +2033,28 @@ function renderRecipeModal() {
         <strong>${recipeModalState.mode === "edit" ? "Edit Recipe" : "Add Recipe"}</strong>
         <span class="pill">${validation.valid ? "Valid" : "Incomplete"}</span>
       </div>
+      <div class="modal-section recipe-modal-grid">
+        <div class="recipe-grid-machine">
+          <label class="field-label">Machine class</label>
+          <select data-recipe-draft="machineClassId">
+            <option value="">Select machine class</option>
+            ${machineClasses.map((machine) => `<option value="${machine.id}" ${machine.id === draft.machineClassId ? "selected" : ""}>${escapeHtml(machine.name)}</option>`).join("")}
+          </select>
+        </div>
+        <div class="recipe-grid-output">
+          <label class="field-label">Produced item</label>
+          <select data-recipe-draft="outputItemId">
+            <option value="">Select output item</option>
+            ${outputSelectableItems.map((item) => `<option value="${item.id}" ${item.id === draft.outputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
+          </select>
+          <label class="field-label" style="margin-top:8px">Output quantity per craft</label>
+          <input type="text" value="${escapeHtml(draft.outputQty)}" data-recipe-draft="outputQty">
+        </div>
+        <div class="recipe-grid-rate">
+          <label class="field-label">Items per minute</label>
+          <input type="text" value="${escapeHtml(draft.itemsPerMinute)}" data-recipe-draft="itemsPerMinute">
+        </div>
+      </div>
       <div class="modal-section">
         <div class="field-label">Inputs</div>
         <div class="modal-grid">
@@ -1823,32 +2072,8 @@ function renderRecipeModal() {
             `;
           }).join("")}
         </div>
-      </div>
-      <div class="modal-section modal-two-col">
-        <div>
-          <label class="field-label">Output item</label>
-          <select data-recipe-draft="outputItemId">
-            <option value="">Select output item</option>
-            ${outputSelectableItems.map((item) => `<option value="${item.id}" ${item.id === draft.outputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
-          </select>
-        </div>
-        <div>
-          <label class="field-label">Output quantity per craft</label>
-          <input type="text" value="${escapeHtml(draft.outputQty)}" data-recipe-draft="outputQty">
-        </div>
-      </div>
-      <div class="modal-section modal-two-col">
-        <div>
-          <label class="field-label">Machine class</label>
-          <select data-recipe-draft="machineClassId">
-            <option value="">Select machine class</option>
-            ${machineClasses.map((machine) => `<option value="${machine.id}" ${machine.id === draft.machineClassId ? "selected" : ""}>${escapeHtml(machine.name)}</option>`).join("")}
-          </select>
-        </div>
-        <div>
-          <label class="field-label">Items per minute</label>
-          <input type="text" value="${escapeHtml(draft.itemsPerMinute)}" data-recipe-draft="itemsPerMinute">
-        </div>
+        ${draft.machineClassId && !validation.inputCountAllowed ? `<p style="color:red">Filled input count ${validation.filledInputCount} does not match the selected machine class allowed set.</p>` : ""}
+        ${validation.incompleteFilledRows ? `<p style="color:red">Each filled input row must have both an item and a quantity greater than 0.</p>` : ""}
       </div>
       <div class="modal-actions">
         <button type="button" class="secondary" data-recipe-modal-close>Cancel</button>
@@ -1882,7 +2107,6 @@ function commitRecipeDraftField(field, rowId = "") {
     const row = draft.inputs.find((entry) => entry.id === rowId);
     if (row) row.qty = normalizeNumericString(row.qty, 6);
   }
-  ensureDraftInputRows(draft);
 }
 
 function attachRecipeModalEvents() {
@@ -1915,19 +2139,23 @@ function attachRecipeModalEvents() {
         const row = recipeModalState.draft.inputs.find((entry) => entry.id === element.dataset.rowId);
         if (!row) return;
         row.itemId = event.target.value;
-        ensureDraftInputRows(recipeModalState.draft);
-        renderRecipeModal();
+        syncRecipeModalUi();
         return;
       }
       if (field === "outputItemId" || field === "machineClassId") {
         recipeModalState.draft[field] = event.target.value;
+        if (field === "machineClassId") {
+          syncDraftInputRowsToMachine(recipeModalState.draft);
+          renderRecipeModal();
+          return;
+        }
         syncRecipeModalUi();
       }
     };
     element.onblur = () => {
       const field = element.dataset.recipeDraft;
       commitRecipeDraftField(field, element.dataset.rowId);
-      renderRecipeModal();
+      syncRecipeModalUi();
     };
     element.onkeydown = (event) => {
       if (event.key === "Enter") {
@@ -2065,8 +2293,8 @@ function render() {
                 `).join("")}
               </div>
             </div>
-            <div><label class="field-label">Allowed splitter sizes</label><input type="text" value="${escapeHtml(state.settings.splitterSizes)}" data-setting="splitterSizes"></div>
-            <div><label class="field-label">Allowed merger sizes</label><input type="text" value="${escapeHtml(state.settings.mergerSizes)}" data-setting="mergerSizes"></div>
+            <div class="mini-summary"><strong>Splitter sizes</strong><br>Hard-coded: 2, 3</div>
+            <div class="mini-summary"><strong>Merger sizes</strong><br>Hard-coded: 2, 3</div>
             <div><label class="field-label">Maximum available power</label><input type="text" value="${escapeHtml(state.settings.maxPower)}" data-setting="maxPower"></div>
             <div>
               <label class="field-label">Target output item</label>
@@ -2134,7 +2362,7 @@ function render() {
         <div class="stack">
           ${state.machineClassRows.map((row, index) => `
             <div class="item-row ${machineStatuses.get(row.id)?.valid ? "valid" : ""}">
-              <div class="row cols-2">
+              <div class="row cols-3">
                 <div>
                   <label class="field-label">Machine name</label>
                   <input type="text" value="${escapeHtml(row.name)}" data-machine-field="name" data-machine-id="${row.id}">
@@ -2143,13 +2371,17 @@ function render() {
                   <label class="field-label">Power usage at 100%</label>
                   <input type="text" value="${escapeHtml(row.power)}" data-machine-field="power" data-machine-id="${row.id}">
                 </div>
+                <div>
+                  <label class="field-label">Allowed input counts</label>
+                  <input type="text" value="${escapeHtml(row.inputCounts)}" data-machine-field="inputCounts" data-machine-id="${row.id}" placeholder="1 or 2, 3">
+                </div>
               </div>
               <div class="footnote">
                 ${machineStatuses.get(row.id)?.valid
                   ? `Registered as <strong>${escapeHtml(row.name.trim())}</strong>.`
                   : index === state.machineClassRows.length - 1
                     ? "Leave one empty row available for the next machine class."
-                    : "Machine class names must be unique and power must be numeric."}
+                    : "Machine class names must be unique, power must be numeric, and allowed input counts must be an exact comma-separated set."}
               </div>
             </div>
           `).join("")}
@@ -2226,6 +2458,7 @@ function render() {
         </div>
         <div class="board-stage">${renderSolverBoard(solution)}</div>
     </section>
+    ${solution.errors.length ? `<div class="app-errors">${solution.errors.map((error) => `<p style="color:red">${escapeHtml(error)}</p>`).join("")}</div>` : ""}
   `;
 
   attachEvents();
@@ -2238,8 +2471,8 @@ function commitSettings(normalizeStrings = true) {
   state.settings.clockMin = normalizeStrings ? normalizeNumericString(String(min), 2) : String(min);
   state.settings.clockMax = "100";
   if (normalizeStrings) {
-    state.settings.splitterSizes = formatListNumbers(parseListNumbers(state.settings.splitterSizes, true));
-    state.settings.mergerSizes = formatListNumbers(parseListNumbers(state.settings.mergerSizes, true));
+    state.settings.splitterSizes = "2, 3";
+    state.settings.mergerSizes = "2, 3";
     const maxPower = parseNumber(state.settings.maxPower);
     state.settings.maxPower = maxPower === null ? "" : normalizeNumericString(String(maxPower), 4);
     const targetRate = parseNumber(state.settings.targetOutputRate);
@@ -2319,6 +2552,7 @@ function attachEvents() {
     input.onblur = () => {
       const row = state.machineClassRows.find((entry) => entry.id === input.dataset.machineId);
       if (row && input.dataset.machineField === "power") row.power = normalizeNumericString(row.power, 4);
+      if (row && input.dataset.machineField === "inputCounts") row.inputCounts = formatListNumbers(parseExactInputCounts(row.inputCounts));
       ensureStateStructure();
       render();
     };

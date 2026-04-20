@@ -720,6 +720,17 @@ svg { width: 100%; display: block; min-height: 430px; }
   gap: 8px;
 }
 
+.recipe-modal-grid {
+  grid-template-columns: 1fr 1fr;
+  grid-template-areas:
+    "machine-name machine-name"
+    "produced-item items-per-minute";
+}
+
+.recipe-grid-machine { grid-area: machine-name; }
+.recipe-grid-output { grid-area: produced-item; }
+.recipe-grid-rate { grid-area: items-per-minute; }
+
 .modal-row {
   display: grid;
   grid-template-columns: 1.3fr 0.8fr auto;
@@ -729,6 +740,10 @@ svg { width: 100%; display: block; min-height: 430px; }
 
 .modal-two-col {
   grid-template-columns: 1fr 1fr;
+}
+
+.app-errors {
+  margin-top: 12px;
 }
 
 .modal-actions {
