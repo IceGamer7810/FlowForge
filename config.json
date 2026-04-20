@@ -1,0 +1,84 @@
+﻿{
+    "belt":  {
+                 "parallelOverlapStep":  18,
+                 "arrowMinOffset":  8,
+                 "minWidth":  8,
+                 "minimumRatio":  0.35,
+                 "arrowSize":  7,
+                 "arrowSpacing":  42,
+                 "baseStroke":  4,
+                 "extraStroke":  4,
+                 "laneSpacingMultiplier":  2,
+                 "machineSpacingDiameterMultiplier":  1,
+                 "protectedZoneDiameterMultiplier":  1
+             },
+    "clock":  {
+                  "step":  1,
+                  "min":  0.01,
+                  "defaultMin":  25,
+                  "max":  100
+              },
+    "storageKey":  "flowforge-state-v2",
+    "defaults":  {
+                     "enableOverflow":  true,
+                     "maxPower":  1000,
+                     "beltSpeeds":  [
+                                        {
+                                            "speed":  60,
+                                            "color":  "blue"
+                                        },
+                                        {
+                                            "speed":  120,
+                                            "color":  "red"
+                                        },
+                                        {
+                                            "speed":  270,
+                                            "color":  "yellow"
+                                        },
+                                        {
+                                            "speed":  480,
+                                            "color":  "limegreen"
+                                        },
+                                        {
+                                            "speed":  780,
+                                            "color":  "orange"
+                                        }
+                                    ],
+                     "targetOutputRate":  60
+                 },
+    "geometry":  {
+                     "machineLabelLine1Offset":  -12,
+                     "topMargin":  170,
+                     "splitterVerticalOffset":  46,
+                     "machineLabelLine2Offset":  8,
+                     "machineInstanceSpacing":  220,
+                     "boardMinWidth":  1200,
+                     "outputTipOffset":  38,
+                     "levelGap":  220,
+                     "routingNodeRadius":  10,
+                     "boardPadding":  48,
+                     "mergerVerticalOffset":  46,
+                     "parallelNodeYOffsetStep":  16,
+                     "boardMinHeight":  560,
+                     "machinePortStem":  28,
+                     "machineHeight":  84,
+                     "machineNodeGapMultiplier":  2,
+                     "machineLabelLine3Offset":  28,
+                     "machineBaseWidth":  170
+                 },
+    "power":  {
+                  "clockExponent":  1.321928
+              },
+    "routing":  {
+                    "crossingDashRadiusMultiplier":  3,
+                    "validationRadius":  20,
+                    "mergerSizes":  [
+                                        2,
+                                        3
+                                    ],
+                    "splitterSizes":  [
+                                          2,
+                                          3
+                                      ]
+                }
+}

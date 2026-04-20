@@ -1,16 +1,20 @@
-const STORAGE_KEY = "flowforge-state-v2";
-const CLOCK_SLIDER_MIN = 0.01;
-const CLOCK_SLIDER_MAX = 100;
-const CLOCK_STEP = 1;
-const FIXED_ROUTING_SIZES = [2, 3];
-const ROUTING_NODE_RADIUS = 10;
+const APP_CONFIG = (() => {
+  if (!window.FLOWFORGE_CONFIG) throw new Error("Missing config.json data.");
+  return window.FLOWFORGE_CONFIG;
+})();
+const DEBUG_LOG_ENABLED = true;
+const STORAGE_KEY = APP_CONFIG.storageKey;
+const CLOCK_SLIDER_MIN = APP_CONFIG.clock.min;
+const CLOCK_SLIDER_MAX = APP_CONFIG.clock.max;
+const CLOCK_STEP = APP_CONFIG.clock.step;
+const ROUTING_NODE_RADIUS = APP_CONFIG.geometry.routingNodeRadius;
 const ROUTING_NODE_DIAMETER = ROUTING_NODE_RADIUS * 2;
-const MACHINE_PORT_STEM = 28;
-const MACHINE_BASE_WIDTH = 170;
-const MACHINE_HEIGHT = 84;
-const BELT_MIN_WIDTH = 8;
-const BELT_LANE_SPACING = BELT_MIN_WIDTH * 2;
-const NODE_ARROW_PROTECTION = ROUTING_NODE_RADIUS + ROUTING_NODE_DIAMETER;
+const MACHINE_PORT_STEM = APP_CONFIG.geometry.machinePortStem;
+const MACHINE_BASE_WIDTH = APP_CONFIG.geometry.machineBaseWidth;
+const MACHINE_HEIGHT = APP_CONFIG.geometry.machineHeight;
+const BELT_MIN_WIDTH = APP_CONFIG.belt.minWidth;
+const BELT_LANE_SPACING = BELT_MIN_WIDTH * APP_CONFIG.belt.laneSpacingMultiplier;
+const NODE_ARROW_PROTECTION = ROUTING_NODE_DIAMETER * (1 + APP_CONFIG.belt.protectedZoneDiameterMultiplier);
 
 const uid = (() => {
   let i = 1;
@@ -18,6 +22,18 @@ const uid = (() => {
 })();
 
 const colorContextCanvas = document.createElement("canvas").getContext("2d");
+
+function debugLog(section, step, message, details) {
+  if (!DEBUG_LOG_ENABLED) return;
+  const prefix = `[${section}.${step}] ${message}`;
+  if (typeof details === "undefined") {
+    console.log(prefix);
+    return;
+  }
+  console.log(prefix, details);
+}
+
+debugLog(1, 1, "App config loaded", APP_CONFIG);
 
 function emptyBeltRow() {
   return { id: uid("belt"), value: "" };
@@ -52,11 +68,11 @@ function emptyBeltSpeedRow() {
 
 function defaultBeltSpeedRows() {
   return [
-    { id: uid("speed"), speed: "60", color: "blue" },
-    { id: uid("speed"), speed: "120", color: "red" },
-    { id: uid("speed"), speed: "270", color: "yellow" },
-    { id: uid("speed"), speed: "480", color: "limegreen" },
-    { id: uid("speed"), speed: "780", color: "orange" },
+    ...APP_CONFIG.defaults.beltSpeeds.map((entry) => ({
+      id: uid("speed"),
+      speed: String(entry.speed),
+      color: String(entry.color)
+    })),
     emptyBeltSpeedRow()
   ];
 }
@@ -68,14 +84,12 @@ function createDefaultState() {
     recipes: [],
     settings: {
       beltSpeeds: defaultBeltSpeedRows(),
-      splitterSizes: "2, 3",
-      mergerSizes: "2, 3",
-      maxPower: "1000",
-      clockMin: "25",
+      maxPower: String(APP_CONFIG.defaults.maxPower),
+      clockMin: String(APP_CONFIG.clock.defaultMin),
       clockMax: "100",
-      enableOverflow: true,
+      enableOverflow: APP_CONFIG.defaults.enableOverflow,
       targetOutputItemId: "",
-      targetOutputRate: "60"
+      targetOutputRate: String(APP_CONFIG.defaults.targetOutputRate)
     }
   };
 }
@@ -179,7 +193,7 @@ function ceilTwoDecimals(num) {
 
 function computeClockedPower(basePower, clockPercent) {
   if (!(basePower > 0) || !(clockPercent > 0)) return 0;
-  return basePower * Math.pow(clockPercent / 100, 1.321928);
+  return basePower * Math.pow(clockPercent / 100, APP_CONFIG.power.clockExponent);
 }
 
 function fmt(num, digits = 2) {
@@ -222,22 +236,6 @@ function sanitizeBeltSpeedRowsInput(inputValue) {
     }));
     return rows.length ? rows : defaultBeltSpeedRows();
   }
-
-  if (typeof inputValue === "string") {
-    const speeds = parseListNumbers(inputValue, false);
-    if (speeds.length) {
-      const fallbackColors = ["blue", "red", "yellow", "limegreen", "orange", "cyan", "tomato"];
-      return [
-        ...speeds.map((speed, index) => ({
-          id: uid("speed"),
-          speed: String(speed),
-          color: fallbackColors[index % fallbackColors.length]
-        })),
-        emptyBeltSpeedRow()
-      ];
-    }
-  }
-
   return defaultBeltSpeedRows();
 }
 
@@ -249,11 +247,11 @@ function getClockSliderValue(value) {
 
 function getSettingsNumbers(targetState = state) {
   const beltSpeeds = getDefinedBeltSpeeds(targetState);
-  const splitterSizes = FIXED_ROUTING_SIZES.slice();
-  const mergerSizes = FIXED_ROUTING_SIZES.slice();
+  const splitterSizes = APP_CONFIG.routing.splitterSizes.slice();
+  const mergerSizes = APP_CONFIG.routing.mergerSizes.slice();
   const maxPower = parseNumber(targetState.settings.maxPower) ?? 0;
-  const minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(targetState.settings.clockMin) ?? 1, CLOCK_SLIDER_MAX));
-  const maxClock = 100;
+  const minClock = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(targetState.settings.clockMin) ?? APP_CONFIG.clock.defaultMin, CLOCK_SLIDER_MAX));
+  const maxClock = APP_CONFIG.clock.max;
   const enableOverflow = Boolean(targetState.settings.enableOverflow);
   const targetOutputRate = parseNumber(targetState.settings.targetOutputRate) ?? 0;
   return {
@@ -797,33 +795,49 @@ function deriveItemRoles(targetState = state) {
 
 function chooseRecipeCandidate(candidates, requiredRate, settings, machineMap) {
   let best = null;
+  debugLog(3, 1, "Choosing recipe candidate", { candidateCount: candidates.length, requiredRate });
   candidates.forEach((recipe) => {
     const machine = machineMap.get(recipe.machineClassId);
     const operatingPoint = computeRecipeOperatingPoint(recipe, machine, requiredRate, settings);
     if (!(operatingPoint.actualRate > 0)) return;
     const score = operatingPoint.powerUse * 1000 + operatingPoint.overflowRate * 10 + operatingPoint.machineCount;
     const candidate = { recipe, machine, ...operatingPoint, score };
+    debugLog(3, 2, "Candidate evaluated", {
+      recipeId: recipe.id,
+      machineId: machine?.id || "",
+      requestedRate: requiredRate,
+      actualRate: operatingPoint.actualRate,
+      overflowRate: operatingPoint.overflowRate,
+      machineCount: operatingPoint.machineCount,
+      powerUse: operatingPoint.powerUse,
+      score
+    });
     if (!best || candidate.score < best.score) best = candidate;
   });
+  debugLog(3, 3, "Candidate selected", best ? {
+    recipeId: best.recipe.id,
+    machineId: best.machine?.id || "",
+    score: best.score
+  } : null);
   return best;
 }
 
 function getRecipeBaseOutputRate(recipe) {
   const speed = parseNumber(recipe.itemsPerMinute);
-  const outputQty = parseNumber(recipe.outputQty);
-  const firstValidInput = (recipe.inputs || [])
-    .map((row) => parseNumber(row.qty))
-    .find((qty) => qty !== null && qty > 0);
-
-  if (speed === null || speed <= 0 || outputQty === null || outputQty <= 0) return 0;
-  const referenceInputQty = firstValidInput || outputQty;
-  return speed * (outputQty / referenceInputQty);
+  return speed !== null && speed > 0 ? speed : 0;
 }
 
 function computeRecipeOperatingPoint(recipe, machine, requestedRate, settings) {
   const outputQty = parseNumber(recipe.outputQty);
   const baseRate = getRecipeBaseOutputRate(recipe);
   if (!machine || outputQty === null || outputQty <= 0 || baseRate === null || baseRate <= 0 || !(requestedRate > 0)) {
+    debugLog(4, 1, "Recipe operating point invalid", {
+      recipeId: recipe?.id || "",
+      machineId: machine?.id || "",
+      requestedRate,
+      outputQty,
+      baseRate
+    });
     return {
       outputQty: outputQty || 0,
       baseRate: baseRate || 0,
@@ -852,7 +866,7 @@ function computeRecipeOperatingPoint(recipe, machine, requestedRate, settings) {
     ...(hasRemainderMachine ? [remainderClock] : [])
   ];
   const instanceRates = instanceClocks.map((instanceClock) => baseRate * (instanceClock / 100));
-  return {
+  const operatingPoint = {
     outputQty,
     baseRate,
     machineCount,
@@ -867,6 +881,13 @@ function computeRecipeOperatingPoint(recipe, machine, requestedRate, settings) {
     instanceClocks,
     instanceRates
   };
+  debugLog(4, 2, "Recipe operating point computed", {
+    recipeId: recipe.id,
+    machineId: machine.id,
+    requestedRate,
+    operatingPoint
+  });
+  return operatingPoint;
 }
 
 function mergeMaps(target, source) {
@@ -883,6 +904,11 @@ function solveFactory(targetState = state) {
   const items = roleState.items;
   const errors = [];
   const warnings = [];
+  debugLog(5, 1, "Solver started", {
+    targetOutputItemId: targetState.settings.targetOutputItemId || "",
+    targetOutputRate: targetState.settings.targetOutputRate,
+    itemCount: items.length
+  });
 
   const { duplicates, duplicateIds, uniqueRecipes } = buildRecipeCatalog(targetState);
   const recipeByOutput = new Map();
@@ -956,24 +982,50 @@ function solveFactory(targetState = state) {
   const overflowBelts = [];
   const remainingExternal = new Map(roleState.externalRates);
   let nextOverflowBelt = 1;
+  const maxBeltSpeed = settings.beltSpeeds.length ? Math.max(...settings.beltSpeeds.map((entry) => entry.speed)) : 0;
+  const beltCapacityWarnings = new Set();
 
   function solveItem(itemId, requiredRate, trail = []) {
+    debugLog(5, 2, "solveItem start", { itemId, requiredRate, trail });
     if (trail.includes(itemId)) return { ok: false, error: `Cycle detected involving ${roleState.itemMap.get(itemId)?.name || "Unknown"}.` };
     const item = roleState.itemMap.get(itemId);
     if (!item) return { ok: false, error: "Unknown item in solver." };
 
     if (roleState.externalInputIds.has(itemId)) {
-      externalDemand.set(itemId, (externalDemand.get(itemId) || 0) + requiredRate);
+      const beltLimitedRate = maxBeltSpeed > 0 ? Math.min(requiredRate, maxBeltSpeed) : requiredRate;
+      if (maxBeltSpeed > 0 && requiredRate > maxBeltSpeed + 1e-9) {
+        const warningKey = `external:${itemId}`;
+        if (!beltCapacityWarnings.has(warningKey)) {
+          warnings.push(`Belt capacity warning: ${item.name} input requires ${fmt(requiredRate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using actual input ${fmt(beltLimitedRate)} item/min for recalculation.`);
+          beltCapacityWarnings.add(warningKey);
+        }
+      }
+      externalDemand.set(itemId, (externalDemand.get(itemId) || 0) + beltLimitedRate);
       const available = remainingExternal.get(itemId) || 0;
-      const deliveredRate = Math.min(requiredRate, available);
+      const deliveredRate = Math.min(beltLimitedRate, available);
       remainingExternal.set(itemId, Math.max(0, available - deliveredRate));
-      const node = { type: "external", itemId, label: item.name, rate: deliveredRate, requestedRate: requiredRate, children: [] };
+      const node = { type: "external", itemId, label: item.name, rate: deliveredRate, requestedRate: beltLimitedRate, children: [] };
+      debugLog(5, 3, "External input resolved", {
+        itemId,
+        itemName: item.name,
+        requiredRate,
+        beltLimitedRate,
+        available,
+        deliveredRate
+      });
       return { ok: true, node, power: 0 };
     }
 
     const candidates = recipeByOutput.get(itemId) || [];
     const chosen = chooseRecipeCandidate(candidates, requiredRate, settings, machineMap);
     if (!chosen) return { ok: false, error: `${item.name} is not externally supplied and no valid recipe can produce it.` };
+    debugLog(5, 4, "Recipe chosen for item", {
+      itemId,
+      itemName: item.name,
+      requiredRate,
+      recipeId: chosen.recipe.id,
+      machineId: chosen.machine.id
+    });
 
     const inputNodes = [];
     const inputLimitedRates = [];
@@ -981,16 +1033,42 @@ function solveFactory(targetState = state) {
       const qty = parseNumber(row.qty);
       if (!row.itemId || qty === null || qty <= 0) continue;
       const neededRate = requiredRate * qty / chosen.outputQty;
-      const inputResult = solveItem(row.itemId, neededRate, [...trail, itemId]);
+      const actualInputRate = maxBeltSpeed > 0 ? Math.min(neededRate, maxBeltSpeed) : neededRate;
+      if (maxBeltSpeed > 0 && neededRate > maxBeltSpeed + 1e-9) {
+        const inputItemName = roleState.itemMap.get(row.itemId)?.name || "Unknown";
+        const warningKey = `input:${itemId}:${row.itemId}`;
+        if (!beltCapacityWarnings.has(warningKey)) {
+          warnings.push(`Belt capacity warning: ${inputItemName} input for ${item.name} requires ${fmt(neededRate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using actual input ${fmt(actualInputRate)} item/min for recalculation.`);
+          beltCapacityWarnings.add(warningKey);
+        }
+      }
+      const inputResult = solveItem(row.itemId, actualInputRate, [...trail, itemId]);
       if (!inputResult.ok) return inputResult;
       inputNodes.push(inputResult.node);
       const deliveredInputRate = inputResult.node.actualRate || inputResult.node.rate || 0;
       inputLimitedRates.push(deliveredInputRate * chosen.outputQty / qty);
+      debugLog(5, 5, "Recipe input processed", {
+        parentItemId: itemId,
+        inputItemId: row.itemId,
+        qtyPerCraft: qty,
+        neededRate,
+        actualInputRate,
+        deliveredInputRate,
+        resultingOutputLimit: deliveredInputRate * chosen.outputQty / qty
+      });
     }
 
     const maxSupportedRate = inputLimitedRates.length ? Math.min(...inputLimitedRates) : requiredRate;
     const desiredRate = Math.max(0, Math.min(requiredRate, maxSupportedRate));
     const operatingPoint = computeRecipeOperatingPoint(chosen.recipe, chosen.machine, desiredRate, settings);
+    debugLog(5, 6, "Item limited by inputs", {
+      itemId,
+      requiredRate,
+      inputLimitedRates,
+      maxSupportedRate,
+      desiredRate,
+      actualRate: operatingPoint.actualRate
+    });
 
     if (operatingPoint.overflowRate > 0) {
       const beltId = nextOverflowBelt++;
@@ -1021,6 +1099,14 @@ function solveFactory(targetState = state) {
     plan.machineCount += operatingPoint.machineCount;
     plan.powerUse += operatingPoint.powerUse;
     plan.clock = Math.max(plan.clock, operatingPoint.clock);
+    debugLog(5, 7, "Plan updated", {
+      recipeId: chosen.recipe.id,
+      requiredRate: plan.requiredRate,
+      actualRate: plan.actualRate,
+      machineCount: plan.machineCount,
+      powerUse: plan.powerUse,
+      clock: plan.clock
+    });
 
     return {
       ok: true,
@@ -1050,13 +1136,13 @@ function solveFactory(targetState = state) {
     : 0;
 
   if (targetResult.ok && producedTargetRate + 1e-9 < targetRate) {
-    errors.push(`Target output is under-satisfied. Required ${fmt(targetRate)} item/min, produced ${fmt(producedTargetRate)} item/min.`);
+    warnings.push(`Target output is under-satisfied. Required ${fmt(targetRate)} item/min, produced ${fmt(producedTargetRate)} item/min.`);
   }
 
   externalDemand.forEach((demand, itemId) => {
     const available = roleState.externalRates.get(itemId) || 0;
     if (demand > available) {
-      errors.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} requires ${fmt(demand)} item/min, but only ${fmt(available)} item/min is externally available.`);
+      warnings.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} requires ${fmt(demand)} item/min, but only ${fmt(available)} item/min is externally available.`);
     }
   });
 
@@ -1064,8 +1150,17 @@ function solveFactory(targetState = state) {
   const totalPower = machinePlans.reduce((sum, plan) => sum + plan.powerUse, 0);
   if (totalPower > settings.maxPower) warnings.push(`Power limit exceeded by ${fmt(totalPower - settings.maxPower)} MW.`);
   if (duplicates.size) warnings.push("Duplicate recipes detected. Only the first instance of each duplicate set is used by the solver.");
+  if (targetResult.ok && maxBeltSpeed > 0) {
+    const warned = new Set();
+    collectNodeFlows(targetResult.node).forEach((flow) => {
+      if (flow.rate > maxBeltSpeed && !warned.has(flow.label)) {
+        warnings.push(`Belt capacity warning: ${flow.label} requires ${fmt(flow.rate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using the fastest belt and recomputing flow.`);
+        warned.add(flow.label);
+      }
+    });
+  }
 
-  return {
+  const result = {
     settings,
     roleState,
     machineList,
@@ -1082,6 +1177,8 @@ function solveFactory(targetState = state) {
     producedTargetRate,
     targetNode: targetResult.ok ? targetResult.node : null
   };
+  debugLog(5, 8, "Solver finished", result);
+  return result;
 }
 
 function nodeTreeDepth(node) {
@@ -1093,6 +1190,14 @@ function nodeTreeDepth(node) {
 function nodeLeafCount(node) {
   if (!node?.children?.length) return 1;
   return node.children.reduce((sum, child) => sum + nodeLeafCount(child), 0);
+}
+
+function collectNodeFlows(node, collector = []) {
+  if (!node) return collector;
+  const rate = node.actualRate || node.rate || 0;
+  if (rate > 0) collector.push({ itemId: node.outputItemId || node.itemId || "", label: node.label || "Item", rate });
+  (node.children || []).forEach((child) => collectNodeFlows(child, collector));
+  return collector;
 }
 
 function averageHexColors(colors) {
@@ -1122,9 +1227,9 @@ function chooseBeltSpeedForRate(rate, beltSpeeds) {
 }
 
 function beltStrokeWidth(rate, beltSpeed) {
-  if (!beltSpeed || !beltSpeed.speed) return 5;
-  const ratio = Math.max(0.35, Math.min(1, rate / beltSpeed.speed));
-  return 4 + ratio * 4;
+  if (!beltSpeed || !beltSpeed.speed) return APP_CONFIG.belt.baseStroke + APP_CONFIG.belt.extraStroke * APP_CONFIG.belt.minimumRatio;
+  const ratio = Math.max(APP_CONFIG.belt.minimumRatio, Math.min(1, rate / beltSpeed.speed));
+  return APP_CONFIG.belt.baseStroke + ratio * APP_CONFIG.belt.extraStroke;
 }
 
 function computeFactoryLayout(node, level = 0, leafCursor = { value: 0 }, layouts = []) {
@@ -1141,7 +1246,88 @@ function computeFactoryLayout(node, level = 0, leafCursor = { value: 0 }, layout
     childLayouts.forEach((entry) => layouts.push(entry));
   }
   layouts.push({ node, level, x });
+  debugLog(6, 1, "Layout node placed", {
+    label: node.label || node.itemId || "",
+    type: node.type,
+    level,
+    x
+  });
   return layouts;
+}
+
+function getLayoutNodeHalfWidth(node) {
+  if (!node || node.type === "external") return 40;
+  const machineCount = Math.max(1, node.machineCount || 1);
+  const inputCount = Math.max(1, (node.children || []).length);
+  const machineWidth = computeMachineWidth(inputCount);
+  const totalWidth = machineWidth + (machineCount - 1) * APP_CONFIG.geometry.machineInstanceSpacing;
+  return totalWidth / 2;
+}
+
+function stabilizeFactoryLayout(layouts) {
+  const byNode = new Map(layouts.map((entry) => [entry.node, { ...entry }]));
+  const entries = layouts.map((entry) => byNode.get(entry.node));
+  const minimumGap = ROUTING_NODE_DIAMETER;
+
+  for (let iteration = 0; iteration < 24; iteration += 1) {
+    let changed = false;
+    debugLog(6, 2, "Layout stabilization iteration", { iteration });
+
+    entries.forEach((entry) => {
+      const children = entry.node?.children || [];
+      if (!children.length) return;
+      const childEntries = children.map((child) => byNode.get(child)).filter(Boolean);
+      if (!childEntries.length) return;
+      const averageX = childEntries.reduce((sum, childEntry) => sum + childEntry.x, 0) / childEntries.length;
+      if (Math.abs(entry.x - averageX) > 0.01) {
+        debugLog(6, 3, "Parent recentered", {
+          label: entry.node.label || entry.node.itemId || "",
+          fromX: entry.x,
+          toX: averageX
+        });
+        entry.x = averageX;
+        changed = true;
+      }
+    });
+
+    const levelGroups = new Map();
+    entries.forEach((entry) => {
+      if (!levelGroups.has(entry.level)) levelGroups.set(entry.level, []);
+      levelGroups.get(entry.level).push(entry);
+    });
+
+    levelGroups.forEach((group) => {
+      group.sort((a, b) => a.x - b.x);
+      for (let index = 1; index < group.length; index += 1) {
+        const previous = group[index - 1];
+        const current = group[index];
+        const previousRight = previous.x + getLayoutNodeHalfWidth(previous.node);
+        const currentLeft = current.x - getLayoutNodeHalfWidth(current.node);
+        const requiredLeft = previousRight + minimumGap;
+        if (currentLeft < requiredLeft - 0.01) {
+          debugLog(6, 4, "Minimum machine distance enforced", {
+            previous: previous.node.label || previous.node.itemId || "",
+            current: current.node.label || current.node.itemId || "",
+            previousRight,
+            currentLeft,
+            requiredLeft,
+            shift: requiredLeft - currentLeft
+          });
+          current.x += requiredLeft - currentLeft;
+          changed = true;
+        }
+      }
+    });
+
+    if (!changed) break;
+  }
+
+  debugLog(6, 5, "Layout stabilization complete", entries.map((entry) => ({
+    label: entry.node.label || entry.node.itemId || "",
+    level: entry.level,
+    x: entry.x
+  })));
+  return entries;
 }
 
 function makeOrthogonalSegments(points) {
@@ -1240,7 +1426,7 @@ function shiftSegmentPerpendicular(belt, segmentIndex, delta) {
 }
 
 function resolveParallelOverlaps(belts) {
-  const laneStep = 18;
+  const laneStep = APP_CONFIG.belt.parallelOverlapStep;
   for (let beltIndex = 0; beltIndex < belts.length; beltIndex += 1) {
     const belt = belts[beltIndex];
     for (let segmentIndex = 0; segmentIndex < belt.segments.length; segmentIndex += 1) {
@@ -1312,21 +1498,21 @@ function renderArrowHeadsForSegment(segment, speedColor, overpass) {
   if (usableLength < 8) return "";
   const direction = segmentDirection(segment);
   const contrast = contrastColor(speedColor);
-  const spacing = 42;
+  const spacing = APP_CONFIG.belt.arrowSpacing;
   const count = Math.max(1, Math.floor(usableLength / spacing));
   const arrows = [];
   for (let index = 1; index <= count; index += 1) {
     const preferredOffset = count === 1
       ? startPadding + usableLength / 2
       : startPadding + (usableLength * index) / (count + 1);
-    const offset = Math.max(startPadding + 8, Math.min(length - endPadding - 8, preferredOffset));
+    const offset = Math.max(startPadding + APP_CONFIG.belt.arrowMinOffset, Math.min(length - endPadding - APP_CONFIG.belt.arrowMinOffset, preferredOffset));
     const x = segment.x1 === segment.x2
       ? segment.x1
       : (segment.x2 > segment.x1 ? segment.x1 + offset : segment.x1 - offset);
     const y = segment.y1 === segment.y2
       ? segment.y1
       : (segment.y2 > segment.y1 ? segment.y1 + offset : segment.y1 - offset);
-    const path = openArrowPath(x, y, direction);
+    const path = openArrowPath(x, y, direction, APP_CONFIG.belt.arrowSize);
     const dash = overpass ? ` stroke-dasharray="4 3"` : "";
     arrows.push(`<path d="${path}" fill="none" stroke="${contrast}" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
     arrows.push(`<path d="${path}" fill="none" stroke="${speedColor}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
@@ -1497,6 +1683,11 @@ function connectBeltPath(collection, itemColor, speedColor, rate, points) {
 }
 
 function renderSolverBoard(solution) {
+  debugLog(7, 1, "Board render start", {
+    reachable: solution.reachable,
+    warningCount: solution.warnings.length,
+    errorCount: solution.errors.length
+  });
   if (!solution.targetNode) {
     const hasTarget = Boolean(solution.settings.targetOutputItemId);
     const hasRecipes = state.recipes.length > 0;
@@ -1524,7 +1715,7 @@ function renderSolverBoard(solution) {
 
   const itemMap = solution.roleState.itemMap;
   const beltSpeeds = solution.settings.beltSpeeds;
-  const layouts = computeFactoryLayout(solution.targetNode);
+  const layouts = stabilizeFactoryLayout(computeFactoryLayout(solution.targetNode));
   const maxLevel = Math.max(...layouts.map((entry) => entry.level));
   const width = Math.max(1200, 280 + Math.max(...layouts.map((entry) => entry.x)));
   const height = Math.max(560, 220 + (maxLevel + 1) * 230);
@@ -1546,18 +1737,38 @@ function renderSolverBoard(solution) {
   const routingNodeMeta = [];
   const planByRecipeId = new Map(solution.machinePlans.map((plan) => [plan.recipeId, plan]));
   const layoutBounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+  let layoutInvalidReason = "";
 
-  function addBelt(collection, itemColor, rate, points, itemName = "", startProtect = 0, endProtect = 0) {
+  function addBelt(collection, itemColor, rate, points, itemName = "", startProtect = 0, endProtect = 0, startConnection = "", endConnection = "") {
+    if (!points || points.length < 2) {
+      layoutInvalidReason = "INVALID: every belt must have a continuous path with start_connection and end_connection.";
+      return;
+    }
+    if (!startConnection || !endConnection) {
+      layoutInvalidReason = "INVALID: every belt must have start_connection and end_connection.";
+      return;
+    }
     const beltSpeed = chooseBeltSpeedForRate(rate, beltSpeeds);
     collection.push({
       itemColor,
       speedColor: beltSpeed?.color || "#ffffff",
       tooltip: `${itemName || "Item"}\n${fmt(rate)} item/min`,
+      startConnection,
+      endConnection,
       segments: applyEndpointProtection(
         makeOrthogonalSegments(points).map((segment) => ({ ...segment, strokeWidth: beltStrokeWidth(rate, beltSpeed) })),
         startProtect,
         endProtect
       )
+    });
+    debugLog(7, 2, "Belt rendered", {
+      itemName,
+      rate,
+      startConnection,
+      endConnection,
+      points,
+      startProtect,
+      endProtect
     });
     points.forEach((point) => extendBounds(layoutBounds, point.x, point.y));
   }
@@ -1565,31 +1776,41 @@ function renderSolverBoard(solution) {
   function addRoutingNode(x, y, color, tooltip, role = "", branchCount = 0) {
     renderedNodes.push(`<g class="factory-routing-node">${renderRoutingNode(x, y, color, tooltip)}</g>`);
     routingNodeMeta.push({ x, y, role, branchCount });
+    debugLog(7, 3, "Routing node rendered", { x, y, color, role, branchCount, tooltip });
     extendBounds(layoutBounds, x - ROUTING_NODE_RADIUS - 2, y - ROUTING_NODE_RADIUS - 2);
     extendBounds(layoutBounds, x + ROUTING_NODE_RADIUS + 2, y + ROUTING_NODE_RADIUS + 2);
   }
 
+  function routeMergerOutputTopOnly(startPoint, targetPoint) {
+    if (!targetPoint || targetPoint.y >= startPoint.y) {
+      layoutInvalidReason = "INVALID: merger.output_direction must be TOP ONLY.";
+      return null;
+    }
+    if (startPoint.x === targetPoint.x) return [startPoint, targetPoint];
+    return compressPoints([startPoint, { x: startPoint.x, y: targetPoint.y }, targetPoint]);
+  }
+
   function connectSplitterTree(startPoint, targetPoints, itemColor, totalRate, levelBaseY, itemName) {
     if (targetPoints.length === 1) {
-      addBelt(belts, itemColor, totalRate, routeHV(startPoint, targetPoints[0]), itemName);
+      addBelt(belts, itemColor, totalRate, routeHV(startPoint, targetPoints[0]), itemName, 0, 0, `${itemName}:source`, `${itemName}:target`);
       return;
     }
 
-    const factors = findExactFactorChain(targetPoints.length, FIXED_ROUTING_SIZES);
+    const factors = findExactFactorChain(targetPoints.length, solution.settings.splitterSizes);
     if (!factors?.length) {
       const nodeX = targetPoints.reduce((sum, point) => sum + point.x, 0) / targetPoints.length;
       const nodeY = levelBaseY;
       const ports = getSplitterPorts(nodeX, nodeY, targetPoints.length);
-      addBelt(belts, itemColor, totalRate, routeIntoPort(startPoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION);
+      addBelt(belts, itemColor, totalRate, routeIntoPort(startPoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source`, `${itemName}:splitter-input`);
       const branchRate = totalRate / targetPoints.length;
       addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(totalRate)} item/min\n${itemName || "Item"} outputs: ${targetPoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}`, "splitter", targetPoints.length);
-      targetPoints.forEach((point, index) => addBelt(belts, itemColor, branchRate, routeOutOfPort(ports.outputs[index].point, point, ports.outputs[index].kind), itemName, NODE_ARROW_PROTECTION, 0));
+      targetPoints.forEach((point, index) => addBelt(belts, itemColor, branchRate, routeOutOfPort(ports.outputs[index].point, point, ports.outputs[index].kind), itemName, NODE_ARROW_PROTECTION, 0, `${itemName}:splitter-output-${index + 1}`, `${itemName}:target-${index + 1}`));
       return;
     }
 
     function recurse(sourcePoint, points, factorIndex, y) {
       if (points.length === 1) {
-        addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(sourcePoint, points[0]), itemName);
+        addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(sourcePoint, points[0]), itemName, 0, 0, `${itemName}:splitter-branch-source`, `${itemName}:splitter-branch-target`);
         return;
       }
       const factor = factors[factorIndex];
@@ -1598,15 +1819,15 @@ function renderSolverBoard(solution) {
       const nodeY = y;
       const inboundRate = totalRate * (points.length / targetPoints.length);
       const ports = getSplitterPorts(nodeX, nodeY, factor);
-      addBelt(belts, itemColor, inboundRate, routeIntoPort(sourcePoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION);
+      addBelt(belts, itemColor, inboundRate, routeIntoPort(sourcePoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source`, `${itemName}:splitter-input`);
       const nextY = y + 34;
       const childRate = inboundRate / factor;
       addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(inboundRate)} item/min\n${itemName || "Item"} outputs: ${groups.map(() => `${fmt(childRate)} item/min`).join(", ")}`, "splitter", factor);
       groups.forEach((group, groupIndex) => {
         const groupPoint = { x: group.reduce((sum, point) => sum + point.x, 0) / group.length, y: nodeY };
-        addBelt(belts, itemColor, childRate * group.length, routeOutOfPort(ports.outputs[groupIndex].point, groupPoint, ports.outputs[groupIndex].kind), itemName, NODE_ARROW_PROTECTION, 0);
+        addBelt(belts, itemColor, childRate * group.length, routeOutOfPort(ports.outputs[groupIndex].point, groupPoint, ports.outputs[groupIndex].kind), itemName, NODE_ARROW_PROTECTION, 0, `${itemName}:splitter-output-${groupIndex + 1}`, `${itemName}:splitter-group-${groupIndex + 1}`);
         if (factorIndex === factors.length - 1) {
-          group.forEach((point) => addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(groupPoint, point), itemName));
+          group.forEach((point, pointIndex) => addBelt(belts, itemColor, totalRate / targetPoints.length, routeHV(groupPoint, point), itemName, 0, 0, `${itemName}:splitter-leaf-source-${pointIndex + 1}`, `${itemName}:splitter-leaf-target-${pointIndex + 1}`));
         } else {
           recurse(groupPoint, group, factorIndex + 1, nextY);
         }
@@ -1618,19 +1839,19 @@ function renderSolverBoard(solution) {
 
   function connectMergerTree(sourcePoints, targetPoint, itemColor, totalRate, levelBaseY, itemName) {
     if (sourcePoints.length === 1) {
-      addBelt(outputBelts, itemColor, totalRate, routeHV(sourcePoints[0], targetPoint), itemName);
+      addBelt(outputBelts, itemColor, totalRate, routeHV(sourcePoints[0], targetPoint), itemName, 0, 0, `${itemName}:source`, `${itemName}:target`);
       return;
     }
 
-    const factors = findExactFactorChain(sourcePoints.length, FIXED_ROUTING_SIZES)?.slice().reverse();
+    const factors = findExactFactorChain(sourcePoints.length, solution.settings.mergerSizes)?.slice().reverse();
     if (!factors?.length) {
       const nodeX = sourcePoints.reduce((sum, point) => sum + point.x, 0) / sourcePoints.length;
       const nodeY = levelBaseY;
       const ports = getMergerPorts(nodeX, nodeY, sourcePoints.length);
       const branchRate = totalRate / sourcePoints.length;
-      sourcePoints.forEach((point, index) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[index].point, ports.inputs[index].kind), itemName, 0, NODE_ARROW_PROTECTION));
+      sourcePoints.forEach((point, index) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[index].point, ports.inputs[index].kind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source-${index + 1}`, `${itemName}:merger-input-${index + 1}`));
       addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${sourcePoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(totalRate)} item/min`, "merger", sourcePoints.length);
-      addBelt(outputBelts, itemColor, totalRate, routeOutOfPort(ports.output.point, targetPoint, ports.output.kind), itemName, NODE_ARROW_PROTECTION, 0);
+      addBelt(outputBelts, itemColor, totalRate, routeMergerOutputTopOnly(ports.output.point, targetPoint), itemName, NODE_ARROW_PROTECTION, 0, `${itemName}:merger-output`, `${itemName}:target`);
       return;
     }
 
@@ -1647,14 +1868,14 @@ function renderSolverBoard(solution) {
         const nodeY = y;
         const ports = getMergerPorts(nodeX, nodeY, group.length);
         const branchRate = totalRate / sourcePoints.length;
-        group.forEach((point, pointIndex) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[pointIndex].point, ports.inputs[pointIndex].kind), itemName, 0, NODE_ARROW_PROTECTION));
+        group.forEach((point, pointIndex) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[pointIndex].point, ports.inputs[pointIndex].kind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source-${pointIndex + 1}`, `${itemName}:merger-input-${pointIndex + 1}`));
         addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${group.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(branchRate * group.length)} item/min`, "merger", group.length);
         nextPoints.push(ports.output.point);
       }
       currentPoints = nextPoints;
       y -= 34;
     }
-    addBelt(outputBelts, itemColor, totalRate, routeHV(currentPoints[0], targetPoint), itemName);
+    addBelt(outputBelts, itemColor, totalRate, routeMergerOutputTopOnly(currentPoints[0], targetPoint), itemName, 0, 0, `${itemName}:merger-output`, `${itemName}:target`);
   }
 
   function buildNodeVisuals(node) {
@@ -1664,7 +1885,7 @@ function renderSolverBoard(solution) {
       const itemColor = getNodeItemColor(node, itemMap);
       const sourceBottomY = pos.y + 34;
       const sourceTopY = pos.y - 18;
-      addBelt(outputBelts, itemColor, node.rate, [{ x: pos.x, y: sourceBottomY }, { x: pos.x, y: sourceTopY }], node.label);
+      addBelt(outputBelts, itemColor, node.rate, [{ x: pos.x, y: sourceBottomY }, { x: pos.x, y: sourceTopY }], node.label, 0, 0, `${node.label}:external-source`, `${node.label}:external-output`);
       extendBounds(layoutBounds, pos.x - 80, pos.y - 24);
       extendBounds(layoutBounds, pos.x + 80, pos.y + 70);
       return { outputX: pos.x, outputY: sourceTopY, itemColor, rate: node.rate, outputs: [{ x: pos.x, y: sourceTopY, rate: node.rate }] };
@@ -1709,20 +1930,24 @@ function renderSolverBoard(solution) {
             compressPoints(routeHV({ x: output.x, y: output.y }, { x: targetX, y: machineInputY })),
             child.label,
             0,
-            machineArrowProtection
+            machineArrowProtection,
+            `${child.label}:output-${outputIndex + 1}`,
+            `${node.label}:machine-input-${outputIndex + 1}-${index + 1}`
           );
         });
       } else if (machineCount === 1) {
         const targetX = machineInputSlots[0][index] ?? machineCenters[0];
         addBelt(
           belts,
-          childVisual.itemColor,
-          childVisual.rate,
-          compressPoints(routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: machineInputY })),
-          child.label,
-          0,
-          machineArrowProtection
-        );
+            childVisual.itemColor,
+            childVisual.rate,
+            compressPoints(routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: machineInputY })),
+            child.label,
+            0,
+            machineArrowProtection,
+            `${child.label}:output`,
+            `${node.label}:machine-input-${index + 1}`
+          );
       } else {
         const targetPoints = machineCenters.map((centerX, machineIndex) => ({
           x: machineInputSlots[machineIndex][index] ?? centerX,
@@ -1742,12 +1967,12 @@ function renderSolverBoard(solution) {
     const outputRate = node.actualRate || node.requiredRate || 0;
 
     if (machineCount === 1) {
-      addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: machineOutputY }, { x: machineCenters[0], y: outputTipY }], node.label, machineArrowProtection, 0);
+      addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: machineOutputY }, { x: machineCenters[0], y: outputTipY }], node.label, machineArrowProtection, 0, `${node.label}:machine-output`, `${node.label}:output-tip`);
     } else {
       const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: machineTopY - machineNodeGap }));
       machineCenters.forEach((centerX, machineIndex) => {
         const instanceRate = instanceRates[machineIndex] || 0;
-        addBelt(outputBelts, outputItemColor, instanceRate, [{ x: centerX, y: machineOutputY }, { x: centerX, y: machineTopY - machineNodeGap }], node.label, machineArrowProtection, 0);
+        addBelt(outputBelts, outputItemColor, instanceRate, [{ x: centerX, y: machineOutputY }, { x: centerX, y: machineTopY - machineNodeGap }], node.label, machineArrowProtection, 0, `${node.label}:machine-output-${machineIndex + 1}`, `${node.label}:merge-source-${machineIndex + 1}`);
       });
       connectMergerTree(sourcePoints, { x: pos.x, y: outputTipY }, outputItemColor, outputRate, mergerY, node.label);
     }
@@ -1784,6 +2009,19 @@ function renderSolverBoard(solution) {
   }
 
   buildNodeVisuals(solution.targetNode);
+  debugLog(7, 4, "Node visuals complete", {
+    renderedNodeCount: renderedNodes.length,
+    beltCount: belts.length,
+    outputBeltCount: outputBelts.length
+  });
+  if (layoutInvalidReason) {
+    return `
+      <svg viewBox="0 0 1200 480" role="img" aria-label="Solver board">
+        <text x="600" y="200" text-anchor="middle" class="board-placeholder">No layout</text>
+        <text x="600" y="230" text-anchor="middle" class="board-placeholder-sub">${escapeHtml(layoutInvalidReason)}</text>
+      </svg>
+    `;
+  }
   const pruneIllegalRoutingSegments = (collection) => {
     collection.forEach((belt) => {
       belt.segments = belt.segments.filter((segment) => {
@@ -1832,6 +2070,7 @@ function renderSolverBoard(solution) {
   const contentHeight = Number.isFinite(layoutBounds.maxY) ? layoutBounds.maxY - layoutBounds.minY + padding * 2 : height;
   const viewWidth = Math.max(width, contentWidth);
   const viewHeight = Math.max(height, contentHeight);
+  debugLog(7, 5, "Viewport resolved", { layoutBounds, shiftX, shiftY, viewWidth, viewHeight });
 
   return `
     <svg viewBox="0 0 ${viewWidth} ${viewHeight}" role="img" aria-label="Factory layout board">
@@ -2171,6 +2410,12 @@ function render() {
   saveLocal();
 
   const solution = solveFactory();
+  debugLog(8, 1, "UI render start", {
+    itemCount: getDefinedItems().length,
+    machineClassCount: getDefinedMachineClasses().length,
+    recipeCount: state.recipes.length,
+    reachable: solution.reachable
+  });
   const items = getDefinedItems();
   const machineClasses = getDefinedMachineClasses();
   const beltSpeedRows = state.settings.beltSpeeds;
@@ -2184,6 +2429,16 @@ function render() {
   const clockMin = getClockSliderValue(state.settings.clockMin || 25);
   const clockMax = 100;
   const sliderLeft = ((clockMin - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
+  const avoidedInvalidCases = [
+    "Arrow placement is kept out of protected zones around machines and routing nodes.",
+    "Belts are routed with orthogonal segments and parallel overlaps are shifted apart.",
+    "Machine inputs remain bottom-only and machine outputs remain top-center only."
+  ];
+  const exampleEdgeCases = [
+    "A target that exceeds raw input supply stays invalid and reports the exact missing quantity.",
+    "A flow above the fastest belt speed emits a warning and continues with the fastest belt.",
+    "Duplicate recipes are marked and ignored after the first matching instance."
+  ];
 
   document.getElementById("app").innerHTML = `
     <div class="top-area">
@@ -2293,8 +2548,6 @@ function render() {
                 `).join("")}
               </div>
             </div>
-            <div class="mini-summary"><strong>Splitter sizes</strong><br>Hard-coded: 2, 3</div>
-            <div class="mini-summary"><strong>Merger sizes</strong><br>Hard-coded: 2, 3</div>
             <div><label class="field-label">Maximum available power</label><input type="text" value="${escapeHtml(state.settings.maxPower)}" data-setting="maxPower"></div>
             <div>
               <label class="field-label">Target output item</label>
@@ -2423,6 +2676,10 @@ function render() {
 
       <div class="summary-strip">
         <div class="mini-summary">
+          <h4>Validation Result</h4>
+          <div class="footnote ${solution.reachable ? "ok-text" : "danger-text"}">${solution.reachable ? "VALID" : "INVALID"}</div>
+        </div>
+        <div class="mini-summary">
           <h4>Machine Plan</h4>
           ${solution.machinePlans.length
             ? solution.machinePlans.map((plan) => `<div class="footnote">${escapeHtml(plan.outputItemName)}: ${plan.machineCount}x ${escapeHtml(plan.machineName)} at ${fmt(plan.clock)}%</div>`).join("")
@@ -2446,6 +2703,14 @@ function render() {
             ? `<div class="footnote warning-text">${solution.duplicateIds.size} duplicate recipe card(s) ignored after the first matching instance.</div>`
             : `<div class="footnote">No duplicate recipes detected.</div>`}
         </div>
+        <div class="mini-summary">
+          <h4>Avoided Invalid Cases</h4>
+          ${avoidedInvalidCases.map((entry) => `<div class="footnote">${escapeHtml(entry)}</div>`).join("")}
+        </div>
+        <div class="mini-summary">
+          <h4>Example Edge Cases</h4>
+          ${exampleEdgeCases.map((entry) => `<div class="footnote">${escapeHtml(entry)}</div>`).join("")}
+        </div>
       </div>
     </div>
 
@@ -2464,15 +2729,17 @@ function render() {
   attachEvents();
   renderColorPicker();
   renderRecipeModal();
+  debugLog(8, 2, "UI render finish", {
+    warningCount: solution.warnings.length,
+    errorCount: solution.errors.length
+  });
 }
 
 function commitSettings(normalizeStrings = true) {
-  const min = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(state.settings.clockMin) ?? 25, 100));
+  const min = Math.max(CLOCK_SLIDER_MIN, Math.min(parseNumber(state.settings.clockMin) ?? APP_CONFIG.clock.defaultMin, APP_CONFIG.clock.max));
   state.settings.clockMin = normalizeStrings ? normalizeNumericString(String(min), 2) : String(min);
-  state.settings.clockMax = "100";
+  state.settings.clockMax = String(APP_CONFIG.clock.max);
   if (normalizeStrings) {
-    state.settings.splitterSizes = "2, 3";
-    state.settings.mergerSizes = "2, 3";
     const maxPower = parseNumber(state.settings.maxPower);
     state.settings.maxPower = maxPower === null ? "" : normalizeNumericString(String(maxPower), 4);
     const targetRate = parseNumber(state.settings.targetOutputRate);
