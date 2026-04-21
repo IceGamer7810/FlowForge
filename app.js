@@ -12,9 +12,24 @@ const ROUTING_NODE_DIAMETER = ROUTING_NODE_RADIUS * 2;
 const MACHINE_PORT_STEM = APP_CONFIG.geometry.machinePortStem;
 const MACHINE_BASE_WIDTH = APP_CONFIG.geometry.machineBaseWidth;
 const MACHINE_HEIGHT = APP_CONFIG.geometry.machineHeight;
+const BOARD_MIN_WIDTH = APP_CONFIG.geometry.boardMinWidth;
+const BOARD_MIN_HEIGHT = APP_CONFIG.geometry.boardMinHeight;
+const BOARD_PADDING = APP_CONFIG.geometry.boardPadding;
+const TOP_MARGIN = APP_CONFIG.geometry.topMargin;
+const LEVEL_GAP = APP_CONFIG.geometry.levelGap;
+const MACHINE_INSTANCE_SPACING = APP_CONFIG.geometry.machineInstanceSpacing;
+const MACHINE_NODE_GAP = ROUTING_NODE_DIAMETER * APP_CONFIG.geometry.machineNodeGapMultiplier;
+const SPLITTER_VERTICAL_OFFSET = APP_CONFIG.geometry.splitterVerticalOffset;
+const MERGER_VERTICAL_OFFSET = APP_CONFIG.geometry.mergerVerticalOffset;
+const PARALLEL_NODE_Y_STEP = APP_CONFIG.geometry.parallelNodeYOffsetStep;
+const OUTPUT_TIP_OFFSET = APP_CONFIG.geometry.outputTipOffset;
+const MACHINE_LABEL_LINE_1_OFFSET = APP_CONFIG.geometry.machineLabelLine1Offset;
+const MACHINE_LABEL_LINE_2_OFFSET = APP_CONFIG.geometry.machineLabelLine2Offset;
+const MACHINE_LABEL_LINE_3_OFFSET = APP_CONFIG.geometry.machineLabelLine3Offset;
 const BELT_MIN_WIDTH = APP_CONFIG.belt.minWidth;
 const BELT_LANE_SPACING = BELT_MIN_WIDTH * APP_CONFIG.belt.laneSpacingMultiplier;
 const NODE_ARROW_PROTECTION = ROUTING_NODE_DIAMETER * (1 + APP_CONFIG.belt.protectedZoneDiameterMultiplier);
+const LOCAL_VALIDATION_RADIUS = APP_CONFIG.routing.validationRadius;
 
 const uid = (() => {
   let i = 1;
@@ -35,12 +50,8 @@ function debugLog(section, step, message, details) {
 
 debugLog(1, 1, "App config loaded", APP_CONFIG);
 
-function emptyBeltRow() {
-  return { id: uid("belt"), value: "" };
-}
-
 function emptyItemRow() {
-  return { id: uid("item"), name: "", color: "", belts: [emptyBeltRow()] };
+  return { id: uid("item"), name: "", color: "", role: "input" };
 }
 
 function emptyMachineClassRow() {
@@ -111,9 +122,7 @@ function sanitizeState(input) {
     id: row.id || uid("item"),
     name: String(row.name || ""),
     color: String(row.color || ""),
-    belts: Array.isArray(row.belts) && row.belts.length
-      ? row.belts.map((belt) => ({ id: belt.id || uid("belt"), value: String(belt.value ?? "") }))
-      : [emptyBeltRow()]
+    role: row.role === "not-input" ? "not-input" : "input"
   }));
 
   next.machineClassRows = next.machineClassRows.map((row) => ({
@@ -168,6 +177,7 @@ let recipeModalState = {
 
 let globalEventsBound = false;
 let tooltipEventsBound = false;
+let lastBoardValidationError = "";
 
 function saveLocal() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -573,26 +583,10 @@ function ensureBeltSpeedRows(targetState = state) {
   targetState.settings.beltSpeeds = allValid || !current.length ? [...current, emptyBeltSpeedRow()] : current;
 }
 
-function sanitizeBeltSelections(targetState = state) {
-  const validBeltValues = new Set(getDefinedBeltSpeeds(targetState).map((entry) => String(entry.speed)));
-  targetState.itemRows.forEach((row) => {
-    row.belts.forEach((belt) => {
-      if (belt.value !== "" && !validBeltValues.has(String(belt.value))) belt.value = "";
-    });
-  });
-}
-
-function ensureTrailingBelts(itemRow) {
-  const nonEmpty = itemRow.belts.filter((belt) => belt.value !== "");
-  itemRow.belts = nonEmpty.length ? [...nonEmpty, emptyBeltRow()] : [emptyBeltRow()];
-}
-
 function ensureStateStructure(targetState = state) {
   ensureItemRows(targetState);
   ensureMachineClassRows(targetState);
   ensureBeltSpeedRows(targetState);
-  sanitizeBeltSelections(targetState);
-  targetState.itemRows.forEach((row) => ensureTrailingBelts(row));
   targetState.recipes = targetState.recipes.map((recipe) => sanitizeRecipe(recipe));
 }
 
@@ -600,7 +594,7 @@ function getDefinedItems(targetState = state) {
   const statuses = getItemRowStatuses(targetState);
   return targetState.itemRows
     .filter((row) => statuses.get(row.id)?.valid)
-    .map((row) => ({ id: row.id, name: row.name.trim(), color: row.color.trim(), belts: row.belts }));
+    .map((row) => ({ id: row.id, name: row.name.trim(), color: row.color.trim(), role: row.role === "not-input" ? "not-input" : "input" }));
 }
 
 function getItemMap(targetState = state) {
@@ -634,10 +628,6 @@ function getDefinedBeltSpeeds(targetState = state) {
 
 function getMachineClassMap(targetState = state) {
   return new Map(getDefinedMachineClasses(targetState).map((row) => [row.id, row]));
-}
-
-function hasRealBeltInput(itemRow) {
-  return itemRow.belts.some((belt) => belt.value !== "");
 }
 
 function sanitizeRecipe(recipe) {
@@ -694,6 +684,7 @@ function getDraftDuplicateInputIds(draft) {
 function getRecipeValidation(draft, targetState = state) {
   const itemMap = getItemMap(targetState);
   const machineMap = getMachineClassMap(targetState);
+  const roleState = deriveItemRoles(targetState);
   const duplicateInputIds = getDraftDuplicateInputIds(draft);
   const filledInputCount = draft.inputs.filter((row) => row.itemId && parseNumber(row.qty) !== null && parseNumber(row.qty) > 0).length;
   const validInputs = draft.inputs
@@ -703,6 +694,7 @@ function getRecipeValidation(draft, targetState = state) {
   const itemsPerMinute = parseNumber(draft.itemsPerMinute);
   const machineClass = machineMap.get(draft.machineClassId);
   const inputCountAllowed = Boolean(machineClass && machineClass.allowedInputCounts.includes(filledInputCount));
+  const outputRoleValid = Boolean(draft.outputItemId && itemMap.has(draft.outputItemId) && !roleState.externalInputIds.has(draft.outputItemId));
   const incompleteFilledRows = draft.inputs.some((row) => {
     const hasItem = Boolean(row.itemId);
     const qty = parseNumber(row.qty);
@@ -713,8 +705,7 @@ function getRecipeValidation(draft, targetState = state) {
     validInputs.length > 0 &&
     duplicateInputIds.size === 0 &&
     !incompleteFilledRows &&
-    draft.outputItemId &&
-    itemMap.has(draft.outputItemId) &&
+    outputRoleValid &&
     outputQty !== null &&
     outputQty > 0 &&
     draft.machineClassId &&
@@ -722,7 +713,7 @@ function getRecipeValidation(draft, targetState = state) {
     inputCountAllowed &&
     itemsPerMinute !== null &&
     itemsPerMinute > 0;
-  return { valid, validInputs, duplicateInputIds, inputCountAllowed, filledInputCount, incompleteFilledRows };
+  return { valid, validInputs, duplicateInputIds, inputCountAllowed, filledInputCount, incompleteFilledRows, outputRoleValid };
 }
 
 function recipeSignature(recipe) {
@@ -739,9 +730,45 @@ function recipeSignature(recipe) {
   });
 }
 
+function getSolverUsableRecipes(targetState = state) {
+  const itemMap = getItemMap(targetState);
+  const machineMap = getMachineClassMap(targetState);
+  return targetState.recipes
+    .map((recipe) => sanitizeRecipe(recipe))
+    .filter((recipe) => {
+      if (!recipe.outputItemId || !itemMap.has(recipe.outputItemId)) return false;
+      if (!recipe.machineClassId || !machineMap.has(recipe.machineClassId)) return false;
+      const outputQty = parseNumber(recipe.outputQty);
+      const itemsPerMinute = parseNumber(recipe.itemsPerMinute);
+      if (!(outputQty > 0) || !(itemsPerMinute > 0)) return false;
+      const validInputs = recipe.inputs
+        .map((row) => ({ itemId: row.itemId, qty: parseNumber(row.qty) }))
+        .filter((row) => row.itemId && itemMap.has(row.itemId) && row.qty !== null && row.qty > 0);
+      if (!validInputs.length) return false;
+      const duplicateInputIds = new Set();
+      const seen = new Set();
+      validInputs.forEach((row) => {
+        if (seen.has(row.itemId)) duplicateInputIds.add(row.itemId);
+        seen.add(row.itemId);
+      });
+      if (duplicateInputIds.size) return false;
+      const machine = machineMap.get(recipe.machineClassId);
+      if (!machine || !machine.allowedInputCounts.includes(validInputs.length)) return false;
+      const incompleteRows = recipe.inputs.some((row) => {
+        const hasItem = Boolean(row.itemId);
+        const qty = parseNumber(row.qty);
+        const hasQty = qty !== null && qty > 0;
+        return hasItem !== hasQty;
+      });
+      if (incompleteRows) return false;
+      return true;
+    });
+}
+
 function getDuplicateRecipeGroups(targetState = state) {
+  const usableRecipes = getSolverUsableRecipes(targetState);
   const groups = new Map();
-  targetState.recipes.forEach((recipe) => {
+  usableRecipes.forEach((recipe) => {
     const signature = recipeSignature(recipe);
     if (!groups.has(signature)) groups.set(signature, []);
     groups.get(signature).push(recipe.id);
@@ -760,34 +787,22 @@ function buildRecipeCatalog(targetState = state) {
 function deriveItemRoles(targetState = state) {
   const items = getDefinedItems(targetState);
   const itemMap = new Map(items.map((item) => [item.id, item]));
-  const externalInputIds = new Set();
-  const externalRates = new Map();
-  items.forEach((item) => {
-    const total = item.belts.map((belt) => parseNumber(belt.value)).filter((value) => value !== null && value > 0).reduce((sum, value) => sum + value, 0);
-    if (total > 0) {
-      externalInputIds.add(item.id);
-      externalRates.set(item.id, total);
-    }
-  });
-
   const producedIds = new Set();
-  targetState.recipes.forEach((recipe) => {
+  getSolverUsableRecipes(targetState).forEach((recipe) => {
     if (recipe.outputItemId && itemMap.has(recipe.outputItemId)) producedIds.add(recipe.outputItemId);
   });
 
+  const externalInputIds = new Set(items.filter((item) => item.role === "input").map((item) => item.id));
   const invalidIds = new Set();
   items.forEach((item) => {
-    const externallySupplied = externalInputIds.has(item.id);
-    const produced = producedIds.has(item.id);
-    const referencedAsInput = targetState.recipes.some((recipe) => recipe.inputs.some((row) => row.itemId === item.id));
-    if (!externallySupplied && !produced && referencedAsInput) invalidIds.add(item.id);
+    if (item.role === "not-input" && !producedIds.has(item.id)) invalidIds.add(item.id);
+    if (item.role === "input" && producedIds.has(item.id)) invalidIds.add(item.id);
   });
 
   return {
     items,
     itemMap,
     externalInputIds,
-    externalRates,
     producedIds,
     invalidIds
   };
@@ -848,12 +863,11 @@ function computeRecipeOperatingPoint(recipe, machine, requestedRate, settings) {
       powerUse: 0
     };
   }
-  const safeMinClock = Math.max(CLOCK_SLIDER_MIN, Math.min(settings.minClock, 100));
   const fullMachines = Math.floor(requestedRate / baseRate);
   const remainder = Math.max(0, requestedRate - fullMachines * baseRate);
   const hasRemainderMachine = remainder > 1e-9;
   const rawClock = hasRemainderMachine ? (remainder / baseRate) * 100 : 0;
-  const remainderClock = hasRemainderMachine ? Math.max(rawClock, safeMinClock) : 0;
+  const remainderClock = hasRemainderMachine ? Math.min(rawClock, 100) : 0;
   const machineCount = fullMachines + (hasRemainderMachine ? 1 : 0);
   const actualRate = fullMachines * baseRate + (hasRemainderMachine ? baseRate * (remainderClock / 100) : 0);
   const overflowRate = Math.max(0, actualRate - requestedRate);
@@ -919,8 +933,34 @@ function solveFactory(targetState = state) {
   });
 
   roleState.invalidIds.forEach((itemId) => {
-    errors.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} is used as an input but has no external belt supply and no producing recipe.`);
+    const item = roleState.itemMap.get(itemId);
+    if (!item) return;
+    if (roleState.externalInputIds.has(itemId)) {
+      errors.push(`${item.name} is marked INPUT but also has a producing recipe. INPUT items must not be produced internally.`);
+    } else {
+      errors.push(`${item.name} is marked NOT INPUT but has no producing recipe.`);
+    }
   });
+
+  if (errors.length) {
+    return {
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalDemand: new Map(),
+      machinePlans: [],
+      totalPower: 0,
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      requestedTargetRate: targetState.settings.targetOutputRate ? (parseNumber(targetState.settings.targetOutputRate) || 0) : 0,
+      producedTargetRate: 0,
+      targetNode: null
+    };
+  }
 
   if (!settings.targetOutputItemId) {
     return {
@@ -929,7 +969,7 @@ function solveFactory(targetState = state) {
       machineList,
       duplicateIds,
       duplicateGroups: duplicates,
-      externalTotals: roleState.externalRates,
+      externalDemand: new Map(),
       machinePlans: [],
       overflowBelts: [],
       warnings,
@@ -948,7 +988,7 @@ function solveFactory(targetState = state) {
       machineList,
       duplicateIds,
       duplicateGroups: duplicates,
-      externalTotals: roleState.externalRates,
+      externalDemand: new Map(),
       machinePlans: [],
       overflowBelts: [],
       warnings,
@@ -967,7 +1007,7 @@ function solveFactory(targetState = state) {
       machineList,
       duplicateIds,
       duplicateGroups: duplicates,
-      externalTotals: roleState.externalRates,
+      externalDemand: new Map(),
       machinePlans: [],
       overflowBelts: [],
       warnings,
@@ -977,187 +1017,277 @@ function solveFactory(targetState = state) {
     };
   }
 
-  const planMap = new Map();
-  const externalDemand = new Map();
-  const overflowBelts = [];
-  const remainingExternal = new Map(roleState.externalRates);
-  let nextOverflowBelt = 1;
-  const maxBeltSpeed = settings.beltSpeeds.length ? Math.max(...settings.beltSpeeds.map((entry) => entry.speed)) : 0;
-  const beltCapacityWarnings = new Set();
-
-  function solveItem(itemId, requiredRate, trail = []) {
-    debugLog(5, 2, "solveItem start", { itemId, requiredRate, trail });
-    if (trail.includes(itemId)) return { ok: false, error: `Cycle detected involving ${roleState.itemMap.get(itemId)?.name || "Unknown"}.` };
-    const item = roleState.itemMap.get(itemId);
-    if (!item) return { ok: false, error: "Unknown item in solver." };
-
-    if (roleState.externalInputIds.has(itemId)) {
-      const beltLimitedRate = maxBeltSpeed > 0 ? Math.min(requiredRate, maxBeltSpeed) : requiredRate;
-      if (maxBeltSpeed > 0 && requiredRate > maxBeltSpeed + 1e-9) {
-        const warningKey = `external:${itemId}`;
-        if (!beltCapacityWarnings.has(warningKey)) {
-          warnings.push(`Belt capacity warning: ${item.name} input requires ${fmt(requiredRate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using actual input ${fmt(beltLimitedRate)} item/min for recalculation.`);
-          beltCapacityWarnings.add(warningKey);
-        }
-      }
-      externalDemand.set(itemId, (externalDemand.get(itemId) || 0) + beltLimitedRate);
-      const available = remainingExternal.get(itemId) || 0;
-      const deliveredRate = Math.min(beltLimitedRate, available);
-      remainingExternal.set(itemId, Math.max(0, available - deliveredRate));
-      const node = { type: "external", itemId, label: item.name, rate: deliveredRate, requestedRate: beltLimitedRate, children: [] };
-      debugLog(5, 3, "External input resolved", {
-        itemId,
-        itemName: item.name,
-        requiredRate,
-        beltLimitedRate,
-        available,
-        deliveredRate
-      });
-      return { ok: true, node, power: 0 };
-    }
-
-    const candidates = recipeByOutput.get(itemId) || [];
-    const chosen = chooseRecipeCandidate(candidates, requiredRate, settings, machineMap);
-    if (!chosen) return { ok: false, error: `${item.name} is not externally supplied and no valid recipe can produce it.` };
-    debugLog(5, 4, "Recipe chosen for item", {
-      itemId,
-      itemName: item.name,
-      requiredRate,
-      recipeId: chosen.recipe.id,
-      machineId: chosen.machine.id
-    });
-
-    const inputNodes = [];
-    const inputLimitedRates = [];
-    for (const row of chosen.recipe.inputs) {
-      const qty = parseNumber(row.qty);
-      if (!row.itemId || qty === null || qty <= 0) continue;
-      const neededRate = requiredRate * qty / chosen.outputQty;
-      const actualInputRate = maxBeltSpeed > 0 ? Math.min(neededRate, maxBeltSpeed) : neededRate;
-      if (maxBeltSpeed > 0 && neededRate > maxBeltSpeed + 1e-9) {
-        const inputItemName = roleState.itemMap.get(row.itemId)?.name || "Unknown";
-        const warningKey = `input:${itemId}:${row.itemId}`;
-        if (!beltCapacityWarnings.has(warningKey)) {
-          warnings.push(`Belt capacity warning: ${inputItemName} input for ${item.name} requires ${fmt(neededRate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using actual input ${fmt(actualInputRate)} item/min for recalculation.`);
-          beltCapacityWarnings.add(warningKey);
-        }
-      }
-      const inputResult = solveItem(row.itemId, actualInputRate, [...trail, itemId]);
-      if (!inputResult.ok) return inputResult;
-      inputNodes.push(inputResult.node);
-      const deliveredInputRate = inputResult.node.actualRate || inputResult.node.rate || 0;
-      inputLimitedRates.push(deliveredInputRate * chosen.outputQty / qty);
-      debugLog(5, 5, "Recipe input processed", {
-        parentItemId: itemId,
-        inputItemId: row.itemId,
-        qtyPerCraft: qty,
-        neededRate,
-        actualInputRate,
-        deliveredInputRate,
-        resultingOutputLimit: deliveredInputRate * chosen.outputQty / qty
-      });
-    }
-
-    const maxSupportedRate = inputLimitedRates.length ? Math.min(...inputLimitedRates) : requiredRate;
-    const desiredRate = Math.max(0, Math.min(requiredRate, maxSupportedRate));
-    const operatingPoint = computeRecipeOperatingPoint(chosen.recipe, chosen.machine, desiredRate, settings);
-    debugLog(5, 6, "Item limited by inputs", {
-      itemId,
-      requiredRate,
-      inputLimitedRates,
-      maxSupportedRate,
-      desiredRate,
-      actualRate: operatingPoint.actualRate
-    });
-
-    if (operatingPoint.overflowRate > 0) {
-      const beltId = nextOverflowBelt++;
-      overflowBelts.push({ id: beltId, itemId, itemName: item.name, rate: operatingPoint.overflowRate, recipeId: chosen.recipe.id });
-      warnings.push(`The recipe ${item.name} produces more output per power than a tighter-fit alternative. Excess will be generated. Overflow belt assigned: Belt ${beltId}`);
-    }
-
-    if (!planMap.has(chosen.recipe.id)) {
-      planMap.set(chosen.recipe.id, {
-        recipeId: chosen.recipe.id,
-        outputItemId: itemId,
-        outputItemName: item.name,
-        machineClassId: chosen.machine.id,
-        machineName: chosen.machine.name,
-        machinePower100: chosen.machine.power,
-        requiredRate: 0,
-        actualRate: 0,
-        machineCount: 0,
-        clock: 0,
-        powerUse: 0,
-        recipe: chosen.recipe
-      });
-    }
-
-    const plan = planMap.get(chosen.recipe.id);
-    plan.requiredRate += requiredRate;
-    plan.actualRate += operatingPoint.actualRate;
-    plan.machineCount += operatingPoint.machineCount;
-    plan.powerUse += operatingPoint.powerUse;
-    plan.clock = Math.max(plan.clock, operatingPoint.clock);
-    debugLog(5, 7, "Plan updated", {
-      recipeId: chosen.recipe.id,
-      requiredRate: plan.requiredRate,
-      actualRate: plan.actualRate,
-      machineCount: plan.machineCount,
-      powerUse: plan.powerUse,
-      clock: plan.clock
-    });
-
+  if (roleState.externalInputIds.has(settings.targetOutputItemId)) {
+    errors.push("Target output item must be a NOT INPUT item.");
     return {
-      ok: true,
-      power: operatingPoint.powerUse + inputNodes.reduce((sum, node) => sum + (node.powerUse || 0), 0),
-      node: {
-        type: "recipe",
-        recipeId: chosen.recipe.id,
-        outputItemId: itemId,
-        label: item.name,
-        machineName: chosen.machine.name,
-        requiredRate,
-        actualRate: operatingPoint.actualRate,
-        overflowRate: operatingPoint.overflowRate,
-        machineCount: operatingPoint.machineCount,
-        instanceClocks: operatingPoint.instanceClocks,
-        instanceRates: operatingPoint.instanceRates,
-        children: inputNodes,
-        powerUse: operatingPoint.powerUse
-      }
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalDemand: new Map(),
+      machinePlans: [],
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      producedTargetRate: 0,
+      requestedTargetRate: targetRate,
+      targetNode: null
     };
   }
 
-  const targetResult = solveItem(settings.targetOutputItemId, targetRate, []);
-  if (!targetResult.ok) errors.push(targetResult.error);
-  const producedTargetRate = targetResult.ok
-    ? (targetResult.node.actualRate || targetResult.node.rate || 0)
-    : 0;
-
-  if (targetResult.ok && producedTargetRate + 1e-9 < targetRate) {
-    warnings.push(`Target output is under-satisfied. Required ${fmt(targetRate)} item/min, produced ${fmt(producedTargetRate)} item/min.`);
+  if (!settings.beltSpeeds.length) {
+    errors.push("At least one belt speed must be defined.");
+    return {
+      settings,
+      roleState,
+      machineList,
+      duplicateIds,
+      duplicateGroups: duplicates,
+      externalDemand: new Map(),
+      machinePlans: [],
+      overflowBelts: [],
+      warnings,
+      errors,
+      reachable: false,
+      producedTargetRate: 0,
+      targetNode: null
+    };
   }
 
-  externalDemand.forEach((demand, itemId) => {
-    const available = roleState.externalRates.get(itemId) || 0;
-    if (demand > available) {
-      warnings.push(`${roleState.itemMap.get(itemId)?.name || "Unknown"} requires ${fmt(demand)} item/min, but only ${fmt(available)} item/min is externally available.`);
-    }
-  });
+  const maxBeltSpeed = settings.beltSpeeds.length ? Math.max(...settings.beltSpeeds.map((entry) => entry.speed)) : 0;
+  function computeIteration(currentTargetRate) {
+    const iterationWarnings = [];
+    const demandMap = new Map();
+    const expandedDemand = new Map();
+    const externalDemand = new Map();
+    const selectedRecipes = new Map();
+    const visiting = new Set();
 
-  const machinePlans = [...planMap.values()];
+    function walkDemand(itemId, additionalDemand, trail = []) {
+      debugLog(5, 2, "walkDemand start", { itemId, additionalDemand, trail });
+      const item = roleState.itemMap.get(itemId);
+      if (!item) return { ok: false, error: "Unknown item in solver." };
+      demandMap.set(itemId, (demandMap.get(itemId) || 0) + additionalDemand);
+
+      if (roleState.externalInputIds.has(itemId)) {
+        externalDemand.set(itemId, demandMap.get(itemId) || 0);
+        debugLog(5, 3, "Input demand accumulated", {
+          itemId,
+          itemName: item.name,
+          accumulatedDemand: demandMap.get(itemId) || 0
+        });
+        return { ok: true };
+      }
+
+      if (visiting.has(itemId)) {
+        return { ok: false, error: `Cycle detected involving ${item.name}.` };
+      }
+      visiting.add(itemId);
+
+      const chosen = selectedRecipes.get(itemId) || chooseRecipeCandidate(recipeByOutput.get(itemId) || [], demandMap.get(itemId) || 0, settings, machineMap);
+      if (!chosen) {
+        visiting.delete(itemId);
+        return { ok: false, error: `${item.name} is required for the final product but has no recipe.` };
+      }
+      selectedRecipes.set(itemId, chosen);
+
+      const totalItemDemand = demandMap.get(itemId) || 0;
+      const alreadyExpanded = expandedDemand.get(itemId) || 0;
+      const deltaDemand = totalItemDemand - alreadyExpanded;
+      if (deltaDemand <= 1e-9) {
+        visiting.delete(itemId);
+        return { ok: true };
+      }
+      const outputQty = parseNumber(chosen.recipe.outputQty) || 0;
+      if (!(outputQty > 0)) {
+        visiting.delete(itemId);
+        return { ok: false, error: `${item.name} has an invalid output quantity.` };
+      }
+      const craftsPerMinute = deltaDemand / outputQty;
+      expandedDemand.set(itemId, totalItemDemand);
+      debugLog(5, 4, "Recipe selected for demand propagation", {
+        itemId,
+        itemName: item.name,
+        recipeId: chosen.recipe.id,
+        machineId: chosen.machine.id,
+        totalItemDemand,
+        deltaDemand,
+        outputQty,
+        craftsPerMinute
+      });
+
+      for (const row of chosen.recipe.inputs) {
+        const qty = parseNumber(row.qty);
+        if (!row.itemId || qty === null || qty <= 0) continue;
+        const inputDemand = craftsPerMinute * qty;
+        const result = walkDemand(row.itemId, inputDemand, [...trail, itemId]);
+        if (!result.ok) {
+          visiting.delete(itemId);
+          return result;
+        }
+      }
+
+      visiting.delete(itemId);
+      return { ok: true };
+    }
+
+    const targetDemandResult = walkDemand(settings.targetOutputItemId, currentTargetRate, []);
+    if (!targetDemandResult.ok) return { ok: false, error: targetDemandResult.error };
+
+    let bottleneck = null;
+
+    function registerBottleneck(kind, itemId, requiredFlow, context) {
+      if (!(maxBeltSpeed > 0) || !(requiredFlow > maxBeltSpeed + 1e-9)) return;
+      const ratio = maxBeltSpeed / requiredFlow;
+      if (!bottleneck || ratio < bottleneck.ratio) {
+        bottleneck = { kind, itemId, requiredFlow, beltCapacity: maxBeltSpeed, ratio, context };
+      }
+    }
+
+    registerBottleneck("final-output", settings.targetOutputItemId, currentTargetRate, "Final output belt");
+
+    demandMap.forEach((requiredFlow, itemId) => {
+      const chosen = selectedRecipes.get(itemId);
+      if (!chosen) return;
+      registerBottleneck("recipe-output", itemId, requiredFlow, "Output after merge");
+      const outputQty = parseNumber(chosen.recipe.outputQty) || 0;
+      const craftsPerMinute = outputQty > 0 ? requiredFlow / outputQty : 0;
+      chosen.recipe.inputs.forEach((row) => {
+        const qty = parseNumber(row.qty);
+        if (!row.itemId || qty === null || qty <= 0) return;
+        const inputFlow = craftsPerMinute * qty;
+        registerBottleneck("recipe-input", row.itemId, inputFlow, `Input before split for ${roleState.itemMap.get(itemId)?.name || "Unknown"}`);
+      });
+    });
+
+    if (bottleneck) {
+      iterationWarnings.push(`Belt limit: ${bottleneck.context} requires ${fmt(bottleneck.requiredFlow)} item/min, but the fastest belt supports ${fmt(bottleneck.beltCapacity)} item/min. Scaling target by ratio ${fmt(bottleneck.ratio, 4)}.`);
+      return {
+        ok: true,
+        bottleneck,
+        warnings: iterationWarnings,
+        scaledTargetRate: currentTargetRate * bottleneck.ratio
+      };
+    }
+
+    const planMap = new Map();
+    function buildNode(itemId, rate) {
+      const item = roleState.itemMap.get(itemId);
+      if (!item) return null;
+      if (roleState.externalInputIds.has(itemId)) {
+        return {
+          type: "external",
+          itemId,
+          label: item.name,
+          rate,
+          requestedRate: rate,
+          actualRate: rate,
+          children: []
+        };
+      }
+
+      const chosen = selectedRecipes.get(itemId);
+      const totalDemand = demandMap.get(itemId) || rate;
+      const branchOperatingPoint = computeRecipeOperatingPoint(chosen.recipe, chosen.machine, rate, settings);
+      const operatingPoint = computeRecipeOperatingPoint(chosen.recipe, chosen.machine, totalDemand, settings);
+      const actualBranchRate = branchOperatingPoint.actualRate;
+      const outputQty = parseNumber(chosen.recipe.outputQty) || 0;
+      const craftsPerMinute = outputQty > 0 ? actualBranchRate / outputQty : 0;
+      const children = chosen.recipe.inputs
+        .map((row) => {
+          const qty = parseNumber(row.qty);
+          if (!row.itemId || qty === null || qty <= 0) return null;
+          return buildNode(row.itemId, craftsPerMinute * qty);
+        })
+        .filter(Boolean);
+
+      if (!planMap.has(chosen.recipe.id)) {
+        planMap.set(chosen.recipe.id, {
+          recipeId: chosen.recipe.id,
+          outputItemId: itemId,
+          outputItemName: item.name,
+          machineClassId: chosen.machine.id,
+          machineName: chosen.machine.name,
+          machinePower100: chosen.machine.power,
+          requiredRate: 0,
+          actualRate: 0,
+          machineCount: 0,
+          clock: 0,
+          powerUse: 0,
+          recipe: chosen.recipe
+        });
+      }
+      const plan = planMap.get(chosen.recipe.id);
+      plan.requiredRate = totalDemand;
+      plan.actualRate = operatingPoint.actualRate;
+      plan.machineCount = operatingPoint.machineCount;
+      plan.powerUse = operatingPoint.powerUse;
+      plan.clock = operatingPoint.clock;
+
+      return {
+        type: "recipe",
+        recipeId: chosen.recipe.id,
+        recipe: chosen.recipe,
+        outputItemId: itemId,
+        label: item.name,
+        machineName: chosen.machine.name,
+        requiredRate: rate,
+        actualRate: actualBranchRate,
+        overflowRate: operatingPoint.overflowRate,
+        machineCount: branchOperatingPoint.machineCount,
+        instanceClocks: branchOperatingPoint.instanceClocks,
+        instanceRates: branchOperatingPoint.instanceRates,
+        children,
+        powerUse: branchOperatingPoint.powerUse
+      };
+    }
+
+    const targetNode = buildNode(settings.targetOutputItemId, currentTargetRate);
+    const producedTargetRate = targetNode?.actualRate || 0;
+    return {
+      ok: true,
+      bottleneck: null,
+      warnings: iterationWarnings,
+      demandMap,
+      externalDemand,
+      machinePlans: [...planMap.values()],
+      targetNode,
+      producedTargetRate
+    };
+  }
+
+  let currentTargetRate = targetRate;
+  let finalIteration = null;
+  for (let iteration = 0; iteration < 32; iteration += 1) {
+    debugLog(5, 9, "Backward-demand iteration", { iteration, currentTargetRate });
+    const iterationResult = computeIteration(currentTargetRate);
+    if (!iterationResult.ok) {
+      errors.push(iterationResult.error);
+      finalIteration = null;
+      break;
+    }
+    warnings.push(...iterationResult.warnings);
+    if (!iterationResult.bottleneck) {
+      finalIteration = iterationResult;
+      break;
+    }
+    const nextTargetRate = iterationResult.scaledTargetRate;
+    if (!(nextTargetRate > 0) || Math.abs(nextTargetRate - currentTargetRate) <= 1e-9) {
+      errors.push("Solver could not make further bottleneck progress.");
+      finalIteration = null;
+      break;
+    }
+    currentTargetRate = nextTargetRate;
+  }
+
+  const machinePlans = finalIteration?.machinePlans || [];
   const totalPower = machinePlans.reduce((sum, plan) => sum + plan.powerUse, 0);
   if (totalPower > settings.maxPower) warnings.push(`Power limit exceeded by ${fmt(totalPower - settings.maxPower)} MW.`);
   if (duplicates.size) warnings.push("Duplicate recipes detected. Only the first instance of each duplicate set is used by the solver.");
-  if (targetResult.ok && maxBeltSpeed > 0) {
-    const warned = new Set();
-    collectNodeFlows(targetResult.node).forEach((flow) => {
-      if (flow.rate > maxBeltSpeed && !warned.has(flow.label)) {
-        warnings.push(`Belt capacity warning: ${flow.label} requires ${fmt(flow.rate)} item/min, exceeding the fastest belt speed ${fmt(maxBeltSpeed)} item/min. Using the fastest belt and recomputing flow.`);
-        warned.add(flow.label);
-      }
-    });
+  if (finalIteration && (finalIteration.producedTargetRate || 0) < targetRate - 1e-9) {
+    warnings.push(`Target output scaled from ${fmt(targetRate)} item/min to ${fmt(finalIteration.producedTargetRate || 0)} item/min due to belt bottlenecks.`);
   }
 
   const result = {
@@ -1166,16 +1296,16 @@ function solveFactory(targetState = state) {
     machineList,
     duplicateIds,
     duplicateGroups: duplicates,
-    externalTotals: roleState.externalRates,
-    externalDemand,
+    externalDemand: finalIteration?.externalDemand || new Map(),
     machinePlans,
     totalPower,
-    overflowBelts,
+    overflowBelts: [],
     warnings: [...new Set(warnings)],
     errors,
-    reachable: errors.length === 0 && Boolean(targetResult.ok) && producedTargetRate + 1e-9 >= targetRate,
-    producedTargetRate,
-    targetNode: targetResult.ok ? targetResult.node : null
+    reachable: errors.length === 0 && Boolean(finalIteration) && (finalIteration?.producedTargetRate || 0) >= targetRate - 1e-9,
+    requestedTargetRate: targetRate,
+    producedTargetRate: finalIteration?.producedTargetRate || 0,
+    targetNode: finalIteration?.targetNode || null
   };
   debugLog(5, 8, "Solver finished", result);
   return result;
@@ -1237,7 +1367,7 @@ function computeFactoryLayout(node, level = 0, leafCursor = { value: 0 }, layout
   const children = node.children || [];
   let x;
   if (!children.length) {
-    x = 140 + leafCursor.value * 220;
+    x = 140 + leafCursor.value * LEVEL_GAP;
     leafCursor.value += 1;
   } else {
     const childLayouts = [];
@@ -1267,7 +1397,7 @@ function getLayoutNodeHalfWidth(node) {
 function stabilizeFactoryLayout(layouts) {
   const byNode = new Map(layouts.map((entry) => [entry.node, { ...entry }]));
   const entries = layouts.map((entry) => byNode.get(entry.node));
-  const minimumGap = ROUTING_NODE_DIAMETER;
+  const minimumGap = Math.max(ROUTING_NODE_DIAMETER * APP_CONFIG.belt.machineSpacingDiameterMultiplier, LOCAL_VALIDATION_RADIUS);
 
   for (let iteration = 0; iteration < 24; iteration += 1) {
     let changed = false;
@@ -1458,6 +1588,7 @@ function resolveParallelOverlaps(belts) {
 function markOverpasses(belts) {
   const horizontals = [];
   const verticals = [];
+  const crossingRadius = APP_CONFIG.routing.crossingDashRadiusMultiplier * ROUTING_NODE_DIAMETER;
   belts.forEach((belt, beltIndex) => {
     belt.segments.forEach((segment, segmentIndex) => {
       const descriptor = { beltIndex, segmentIndex, segment };
@@ -1470,7 +1601,13 @@ function markOverpasses(belts) {
     verticals.forEach((vertical) => {
       if (horizontal.beltIndex === vertical.beltIndex) return;
       if (nonEndpointCrossing(horizontal.segment, vertical.segment)) {
-        belts[horizontal.beltIndex].segments[horizontal.segmentIndex].overpass = true;
+        const overpassSegment = belts[horizontal.beltIndex].segments[horizontal.segmentIndex];
+        overpassSegment.overpass = true;
+        if (!Array.isArray(overpassSegment.crossingWindows)) overpassSegment.crossingWindows = [];
+        overpassSegment.crossingWindows.push({
+          from: vertical.segment.x1 - crossingRadius,
+          to: vertical.segment.x1 + crossingRadius
+        });
       }
     });
   });
@@ -1512,10 +1649,12 @@ function renderArrowHeadsForSegment(segment, speedColor, overpass) {
     const y = segment.y1 === segment.y2
       ? segment.y1
       : (segment.y2 > segment.y1 ? segment.y1 + offset : segment.y1 - offset);
+    if (Array.isArray(segment.crossingWindows) && segment.crossingWindows.some((window) => x >= Math.min(window.from, window.to) && x <= Math.max(window.from, window.to))) {
+      continue;
+    }
     const path = openArrowPath(x, y, direction, APP_CONFIG.belt.arrowSize);
-    const dash = overpass ? ` stroke-dasharray="4 3"` : "";
-    arrows.push(`<path d="${path}" fill="none" stroke="${contrast}" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
-    arrows.push(`<path d="${path}" fill="none" stroke="${speedColor}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"${dash}></path>`);
+    arrows.push(`<path d="${path}" fill="none" stroke="${contrast}" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"></path>`);
+    arrows.push(`<path d="${path}" fill="none" stroke="${speedColor}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>`);
   }
   return arrows.join("");
 }
@@ -1525,11 +1664,33 @@ function renderFactoryBelt(belt) {
   const speedColor = belt.speedColor || "#ffffff";
   const tooltipAttr = belt.tooltip ? ` data-factory-tooltip="${escapeHtml(belt.tooltip)}"` : "";
   return `<g class="factory-belt"${tooltipAttr}>${belt.segments.map((segment) => {
-    const dash = segment.overpass ? ` stroke-dasharray="12 10"` : "";
     const strokeWidth = segment.strokeWidth || 6;
+    const renderLinePieces = () => {
+      if (!segment.overpass || !Array.isArray(segment.crossingWindows) || !segment.crossingWindows.length || !segmentIsHorizontal(segment)) {
+        return `<line x1="${segment.x1}" y1="${segment.y1}" x2="${segment.x2}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round"></line>`;
+      }
+      const minX = Math.min(segment.x1, segment.x2);
+      const maxX = Math.max(segment.x1, segment.x2);
+      const pieces = [];
+      const windows = [...segment.crossingWindows]
+        .map((window) => ({ from: Math.max(minX, Math.min(window.from, window.to)), to: Math.min(maxX, Math.max(window.from, window.to)) }))
+        .sort((a, b) => a.from - b.from);
+      let cursor = minX;
+      windows.forEach((window) => {
+        if (window.from > cursor) {
+          pieces.push(`<line x1="${cursor}" y1="${segment.y1}" x2="${window.from}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round"></line>`);
+        }
+        pieces.push(`<line x1="${window.from}" y1="${segment.y1}" x2="${window.to}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round" stroke-dasharray="12 10"></line>`);
+        cursor = Math.max(cursor, window.to);
+      });
+      if (cursor < maxX) {
+        pieces.push(`<line x1="${cursor}" y1="${segment.y1}" x2="${maxX}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round"></line>`);
+      }
+      return pieces.join("");
+    };
     return `
       <g>
-        <line x1="${segment.x1}" y1="${segment.y1}" x2="${segment.x2}" y2="${segment.y2}" stroke="${itemColor}" stroke-width="${strokeWidth}" stroke-linecap="round"${dash}></line>
+        ${renderLinePieces()}
         ${renderArrowHeadsForSegment(segment, speedColor, segment.overpass)}
       </g>
     `;
@@ -1559,6 +1720,7 @@ function getSplitterPorts(x, y, branchCount) {
       ]
     };
   }
+  if (branchCount !== 3) return null;
   return {
     input: { x, y },
     inputKind: "bottom",
@@ -1580,6 +1742,7 @@ function getMergerPorts(x, y, branchCount) {
       output: { point: { x, y }, kind: "top" }
     };
   }
+  if (branchCount !== 3) return null;
   return {
     inputs: [
       { point: { x, y }, kind: "side" },
@@ -1607,7 +1770,7 @@ function getMachineInputSlotXs(centerX, machineWidth, inputCount) {
 }
 
 function findExactFactorChain(target, allowedSizes) {
-  const sizes = [...new Set((allowedSizes || []).filter((size) => Number.isInteger(size) && size > 1))].sort((a, b) => a - b);
+  const sizes = [...new Set((allowedSizes || []).filter((size) => Number.isInteger(size) && size > 1))].sort((a, b) => b - a);
   if (target <= 1) return [];
   if (!sizes.length) return null;
 
@@ -1683,6 +1846,7 @@ function connectBeltPath(collection, itemColor, speedColor, rate, points) {
 }
 
 function renderSolverBoard(solution) {
+  lastBoardValidationError = "";
   debugLog(7, 1, "Board render start", {
     reachable: solution.reachable,
     warningCount: solution.warnings.length,
@@ -1717,17 +1881,14 @@ function renderSolverBoard(solution) {
   const beltSpeeds = solution.settings.beltSpeeds;
   const layouts = stabilizeFactoryLayout(computeFactoryLayout(solution.targetNode));
   const maxLevel = Math.max(...layouts.map((entry) => entry.level));
-  const width = Math.max(1200, 280 + Math.max(...layouts.map((entry) => entry.x)));
-  const height = Math.max(560, 220 + (maxLevel + 1) * 230);
+  const width = Math.max(BOARD_MIN_WIDTH, 280 + Math.max(...layouts.map((entry) => entry.x)));
+  const height = Math.max(BOARD_MIN_HEIGHT, 220 + (maxLevel + 1) * (LEVEL_GAP + 10));
   const machineHeight = MACHINE_HEIGHT;
-  const topMargin = 170;
-  const levelGap = 220;
-  const machineNodeGap = ROUTING_NODE_DIAMETER;
   const positions = new Map();
   layouts.forEach((entry) => {
     positions.set(entry.node, {
       x: entry.x,
-      y: topMargin + entry.level * levelGap
+      y: TOP_MARGIN + entry.level * LEVEL_GAP
     });
   });
 
@@ -1735,6 +1896,7 @@ function renderSolverBoard(solution) {
   const outputBelts = [];
   const renderedNodes = [];
   const routingNodeMeta = [];
+  const machineMeta = [];
   const planByRecipeId = new Map(solution.machinePlans.map((plan) => [plan.recipeId, plan]));
   const layoutBounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
   let layoutInvalidReason = "";
@@ -1798,13 +1960,7 @@ function renderSolverBoard(solution) {
 
     const factors = findExactFactorChain(targetPoints.length, solution.settings.splitterSizes);
     if (!factors?.length) {
-      const nodeX = targetPoints.reduce((sum, point) => sum + point.x, 0) / targetPoints.length;
-      const nodeY = levelBaseY;
-      const ports = getSplitterPorts(nodeX, nodeY, targetPoints.length);
-      addBelt(belts, itemColor, totalRate, routeIntoPort(startPoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source`, `${itemName}:splitter-input`);
-      const branchRate = totalRate / targetPoints.length;
-      addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(totalRate)} item/min\n${itemName || "Item"} outputs: ${targetPoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}`, "splitter", targetPoints.length);
-      targetPoints.forEach((point, index) => addBelt(belts, itemColor, branchRate, routeOutOfPort(ports.outputs[index].point, point, ports.outputs[index].kind), itemName, NODE_ARROW_PROTECTION, 0, `${itemName}:splitter-output-${index + 1}`, `${itemName}:target-${index + 1}`));
+      layoutInvalidReason = `INVALID: cannot split ${itemName || "item"} into ${targetPoints.length} equal outputs using configured splitter sizes.`;
       return;
     }
 
@@ -1819,8 +1975,12 @@ function renderSolverBoard(solution) {
       const nodeY = y;
       const inboundRate = totalRate * (points.length / targetPoints.length);
       const ports = getSplitterPorts(nodeX, nodeY, factor);
+      if (!ports) {
+        layoutInvalidReason = `INVALID: splitter branch count ${factor} is not supported by exact geometry.`;
+        return;
+      }
       addBelt(belts, itemColor, inboundRate, routeIntoPort(sourcePoint, ports.input, ports.inputKind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source`, `${itemName}:splitter-input`);
-      const nextY = y + 34;
+      const nextY = y + SPLITTER_VERTICAL_OFFSET;
       const childRate = inboundRate / factor;
       addRoutingNode(nodeX, nodeY, itemColor, `Splitter\n${itemName || "Item"} input: ${fmt(inboundRate)} item/min\n${itemName || "Item"} outputs: ${groups.map(() => `${fmt(childRate)} item/min`).join(", ")}`, "splitter", factor);
       groups.forEach((group, groupIndex) => {
@@ -1845,13 +2005,7 @@ function renderSolverBoard(solution) {
 
     const factors = findExactFactorChain(sourcePoints.length, solution.settings.mergerSizes)?.slice().reverse();
     if (!factors?.length) {
-      const nodeX = sourcePoints.reduce((sum, point) => sum + point.x, 0) / sourcePoints.length;
-      const nodeY = levelBaseY;
-      const ports = getMergerPorts(nodeX, nodeY, sourcePoints.length);
-      const branchRate = totalRate / sourcePoints.length;
-      sourcePoints.forEach((point, index) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[index].point, ports.inputs[index].kind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source-${index + 1}`, `${itemName}:merger-input-${index + 1}`));
-      addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${sourcePoints.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(totalRate)} item/min`, "merger", sourcePoints.length);
-      addBelt(outputBelts, itemColor, totalRate, routeMergerOutputTopOnly(ports.output.point, targetPoint), itemName, NODE_ARROW_PROTECTION, 0, `${itemName}:merger-output`, `${itemName}:target`);
+      layoutInvalidReason = `INVALID: cannot merge ${sourcePoints.length} equal inputs for ${itemName || "item"} using configured merger sizes.`;
       return;
     }
 
@@ -1867,15 +2021,248 @@ function renderSolverBoard(solution) {
         const nodeX = group.reduce((sum, point) => sum + point.x, 0) / group.length;
         const nodeY = y;
         const ports = getMergerPorts(nodeX, nodeY, group.length);
+        if (!ports) {
+          layoutInvalidReason = `INVALID: merger branch count ${group.length} is not supported by exact geometry.`;
+          return;
+        }
         const branchRate = totalRate / sourcePoints.length;
         group.forEach((point, pointIndex) => addBelt(outputBelts, itemColor, branchRate, routeIntoPort(point, ports.inputs[pointIndex].point, ports.inputs[pointIndex].kind), itemName, 0, NODE_ARROW_PROTECTION, `${itemName}:source-${pointIndex + 1}`, `${itemName}:merger-input-${pointIndex + 1}`));
         addRoutingNode(nodeX, nodeY, itemColor, `Merger\n${itemName || "Item"} inputs: ${group.map(() => `${fmt(branchRate)} item/min`).join(", ")}\n${itemName || "Item"} output: ${fmt(branchRate * group.length)} item/min`, "merger", group.length);
         nextPoints.push(ports.output.point);
       }
       currentPoints = nextPoints;
-      y -= 34;
+      y -= MERGER_VERTICAL_OFFSET;
     }
     addBelt(outputBelts, itemColor, totalRate, routeMergerOutputTopOnly(currentPoints[0], targetPoint), itemName, 0, 0, `${itemName}:merger-output`, `${itemName}:target`);
+  }
+
+  function connectOutputsToTargets(sourceOutputs, targetPoints, itemColor, levelBaseY, itemName, targetProtect = 0) {
+    const orderedSources = [...sourceOutputs].sort((a, b) => a.x - b.x);
+    const orderedTargets = [...targetPoints].sort((a, b) => a.x - b.x);
+    const gcd = (a, b) => b ? gcd(b, a % b) : a;
+    const lcm = (a, b) => Math.abs(a * b) / gcd(a, b);
+    const totalSourceRate = orderedSources.reduce((sum, output) => sum + (output.rate || 0), 0);
+    const totalTargetRate = orderedTargets.reduce((sum, point) => sum + (point.rate || 0), 0);
+    debugLog(7, 6, "connectOutputsToTargets start", {
+      itemName,
+      sourceCount: orderedSources.length,
+      targetCount: orderedTargets.length,
+      totalSourceRate,
+      totalTargetRate
+    });
+
+    if (orderedTargets.some((point) => Number.isFinite(point.rate)) && Math.abs(totalSourceRate - totalTargetRate) > 1e-6) {
+      debugLog(7, 7, "connectOutputsToTargets invalid: source/target rate mismatch", { itemName, totalSourceRate, totalTargetRate });
+      layoutInvalidReason = `INVALID: source/target rate mismatch for ${itemName}.`;
+      return false;
+    }
+
+    if (orderedSources.length === orderedTargets.length) {
+      const sourceRates = orderedSources.map((output) => output.rate || 0).sort((a, b) => a - b);
+      const targetRates = orderedTargets.map((point) => point.rate || 0).sort((a, b) => a - b);
+      const branchRatesCompatible = targetRates.every((rate, index) => Math.abs(rate - sourceRates[index]) <= 1e-6);
+      if (orderedTargets.some((point) => Number.isFinite(point.rate)) && !branchRatesCompatible) {
+        debugLog(7, 8, "connectOutputsToTargets invalid: branch rate mismatch on direct mapping", {
+          itemName,
+          sourceRates,
+          targetRates
+        });
+        layoutInvalidReason = `INVALID: direct branch mapping rate mismatch for ${itemName}.`;
+        return false;
+      }
+      debugLog(7, 8, "connectOutputsToTargets direct parallel mapping", { itemName });
+      orderedSources.forEach((output, outputIndex) => {
+        addBelt(
+          belts,
+          itemColor,
+          output.rate,
+          compressPoints(routeHV({ x: output.x, y: output.y }, orderedTargets[outputIndex])),
+          itemName,
+          0,
+          targetProtect,
+          `${itemName}:output-${outputIndex + 1}`,
+          `${itemName}:machine-input-${outputIndex + 1}`
+        );
+      });
+      return true;
+    }
+
+    if (orderedSources.length === 1) {
+      debugLog(7, 9, "connectOutputsToTargets split-only path", { itemName });
+      connectSplitterTree({ x: orderedSources[0].x, y: orderedSources[0].y }, orderedTargets, itemColor, orderedSources[0].rate || 0, levelBaseY, itemName);
+      return !layoutInvalidReason;
+    }
+
+    if (orderedTargets.length === 1) {
+      debugLog(7, 10, "connectOutputsToTargets merge-only path", { itemName });
+      connectMergerTree(orderedSources.map((output) => ({ x: output.x, y: output.y })), orderedTargets[0], itemColor, orderedSources.reduce((sum, output) => sum + (output.rate || 0), 0), levelBaseY, itemName);
+      return !layoutInvalidReason;
+    }
+
+    if (orderedTargets.length % orderedSources.length === 0) {
+      debugLog(7, 11, "connectOutputsToTargets divisible split-only distribution", { itemName });
+      const targetsPerSource = orderedTargets.length / orderedSources.length;
+      orderedSources.forEach((output, sourceIndex) => {
+        const targetSlice = orderedTargets.slice(sourceIndex * targetsPerSource, (sourceIndex + 1) * targetsPerSource);
+        connectSplitterTree({ x: output.x, y: output.y }, targetSlice, itemColor, targetSlice.reduce((sum, point) => sum + (point.rate || 0), 0) || output.rate || 0, levelBaseY + sourceIndex * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      return !layoutInvalidReason;
+    }
+
+    if (orderedSources.length % orderedTargets.length === 0) {
+      debugLog(7, 12, "connectOutputsToTargets divisible merge-only distribution", { itemName });
+      const sourcesPerTarget = orderedSources.length / orderedTargets.length;
+      orderedTargets.forEach((targetPoint, targetIndex) => {
+        const sourceSlice = orderedSources.slice(targetIndex * sourcesPerTarget, (targetIndex + 1) * sourcesPerTarget);
+        connectMergerTree(sourceSlice.map((output) => ({ x: output.x, y: output.y })), targetPoint, itemColor, targetPoint.rate || sourceSlice.reduce((sum, output) => sum + (output.rate || 0), 0), levelBaseY - targetIndex * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      return !layoutInvalidReason;
+    }
+
+    const uniformSourceRates = orderedSources.every((output) => Math.abs((output.rate || 0) - (orderedSources[0].rate || 0)) <= 1e-9);
+    if (uniformSourceRates) {
+      debugLog(7, 13, "connectOutputsToTargets uniform split-then-merge path", { itemName });
+      const branchProduct = lcm(orderedSources.length, orderedTargets.length);
+      const leavesPerSource = branchProduct / orderedSources.length;
+      const sourcesPerTarget = branchProduct / orderedTargets.length;
+      const averageTargetY = orderedTargets.reduce((sum, point) => sum + point.y, 0) / orderedTargets.length;
+      const averageSourceY = orderedSources.reduce((sum, point) => sum + point.y, 0) / orderedSources.length;
+      const leafY = averageTargetY + (averageSourceY - averageTargetY) * 0.45;
+      const leafPointsByTarget = orderedTargets.map((targetPoint, targetIndex) => {
+        const totalWidth = (sourcesPerTarget - 1) * BELT_LANE_SPACING;
+        const leftX = targetPoint.x - totalWidth / 2;
+        return Array.from({ length: sourcesPerTarget }, (_, branchIndex) => ({
+          x: leftX + branchIndex * BELT_LANE_SPACING,
+          y: leafY,
+          targetIndex
+        }));
+      });
+      const allLeafPoints = leafPointsByTarget.flat();
+      if (allLeafPoints.length !== branchProduct) {
+        layoutInvalidReason = `INVALID: failed to construct balanced split-then-merge leaves for ${itemName}.`;
+        return false;
+      }
+      orderedSources.forEach((output, sourceIndex) => {
+        const leafSlice = allLeafPoints.slice(sourceIndex * leavesPerSource, (sourceIndex + 1) * leavesPerSource)
+          .map((point) => ({ x: point.x, y: point.y }));
+        connectSplitterTree({ x: output.x, y: output.y }, leafSlice, itemColor, output.rate || 0, levelBaseY + sourceIndex * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      if (layoutInvalidReason) return false;
+      orderedTargets.forEach((targetPoint, targetIndex) => {
+        const sourceSlice = leafPointsByTarget[targetIndex].map((point) => ({ x: point.x, y: point.y }));
+        const mergedRate = targetPoint.rate || orderedSources.reduce((sum, output) => sum + ((output.rate || 0) / leavesPerSource), 0);
+        connectMergerTree(sourceSlice, targetPoint, itemColor, mergedRate, levelBaseY - (targetIndex + 1) * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      return !layoutInvalidReason;
+    }
+
+    const branchProduct = lcm(orderedSources.length, orderedTargets.length);
+    const leavesPerSource = branchProduct / orderedSources.length;
+    const sourcesPerTarget = branchProduct / orderedTargets.length;
+    const targetBuckets = orderedTargets.map((targetPoint, targetIndex) => ({
+      targetIndex,
+      targetPoint,
+      requiredRate: targetPoint.rate || (totalSourceRate / orderedTargets.length),
+      assignedRate: 0,
+      assignedLeaves: []
+    }));
+    const leaves = orderedSources.flatMap((output, sourceIndex) => Array.from({ length: leavesPerSource }, (_, leafIndex) => ({
+      sourceIndex,
+      leafIndex,
+      rate: (output.rate || 0) / leavesPerSource
+    }))).sort((a, b) => b.rate - a.rate || a.sourceIndex - b.sourceIndex || a.leafIndex - b.leafIndex);
+    const leafAssignments = Array.from({ length: targetBuckets.length }, () => []);
+    const bucketRates = targetBuckets.map(() => 0);
+    const bucketCounts = targetBuckets.map(() => 0);
+
+    function assignLeavesRecursively(leafIndex) {
+      if (leafIndex >= leaves.length) {
+        return targetBuckets.every((bucket, bucketIndex) =>
+          bucketCounts[bucketIndex] === sourcesPerTarget &&
+          Math.abs(bucketRates[bucketIndex] - bucket.requiredRate) <= 1e-6
+        );
+      }
+
+      const leaf = leaves[leafIndex];
+      const remainingLeaves = leaves.length - leafIndex - 1;
+      const candidateOrder = targetBuckets
+        .map((bucket, bucketIndex) => ({
+          bucket,
+          bucketIndex,
+          remainingRate: bucket.requiredRate - bucketRates[bucketIndex]
+        }))
+        .filter((entry) => bucketCounts[entry.bucketIndex] < sourcesPerTarget && entry.remainingRate >= leaf.rate - 1e-6)
+        .sort((a, b) => b.remainingRate - a.remainingRate || a.bucketIndex - b.bucketIndex);
+
+      for (const candidate of candidateOrder) {
+        const bucketIndex = candidate.bucketIndex;
+        const slotsLeftAfter = sourcesPerTarget - (bucketCounts[bucketIndex] + 1);
+        if (remainingLeaves < slotsLeftAfter) continue;
+
+        leafAssignments[bucketIndex].push(leaf);
+        bucketRates[bucketIndex] += leaf.rate;
+        bucketCounts[bucketIndex] += 1;
+
+        const globallyPossible = targetBuckets.every((bucket, verifyIndex) => {
+          if (bucketCounts[verifyIndex] > sourcesPerTarget) return false;
+          if (bucketRates[verifyIndex] - bucket.requiredRate > 1e-6) return false;
+          const slotsLeft = sourcesPerTarget - bucketCounts[verifyIndex];
+          const maxPossibleAdditional = leaves.slice(leafIndex + 1, leafIndex + 1 + slotsLeft).reduce((sum, nextLeaf) => sum + nextLeaf.rate, 0);
+          return bucketRates[verifyIndex] + maxPossibleAdditional >= bucket.requiredRate - 1e-6;
+        });
+
+        if (globallyPossible && assignLeavesRecursively(leafIndex + 1)) return true;
+
+        leafAssignments[bucketIndex].pop();
+        bucketRates[bucketIndex] -= leaf.rate;
+        bucketCounts[bucketIndex] -= 1;
+      }
+
+      return false;
+    }
+
+    const exactLeafAssignment = assignLeavesRecursively(0);
+    if (exactLeafAssignment) {
+      targetBuckets.forEach((bucket, bucketIndex) => {
+        bucket.assignedLeaves = leafAssignments[bucketIndex];
+        bucket.assignedRate = bucketRates[bucketIndex];
+      });
+    }
+
+    if (exactLeafAssignment) {
+      debugLog(7, 14, "connectOutputsToTargets non-uniform exact leaf assignment path", { itemName, branchProduct, leavesPerSource, sourcesPerTarget });
+      const averageTargetY = orderedTargets.reduce((sum, point) => sum + point.y, 0) / orderedTargets.length;
+      const averageSourceY = orderedSources.reduce((sum, point) => sum + point.y, 0) / orderedSources.length;
+      const leafY = averageTargetY + (averageSourceY - averageTargetY) * 0.45;
+      const sourceLeafPoints = orderedSources.map(() => []);
+      targetBuckets.forEach((bucket) => {
+        const totalWidth = (bucket.assignedLeaves.length - 1) * BELT_LANE_SPACING;
+        const leftX = bucket.targetPoint.x - totalWidth / 2;
+        const mergeLeafPoints = bucket.assignedLeaves.map((leaf, branchIndex) => {
+          const point = { x: leftX + branchIndex * BELT_LANE_SPACING, y: leafY };
+          sourceLeafPoints[leaf.sourceIndex].push(point);
+          return point;
+        });
+        connectMergerTree(mergeLeafPoints, bucket.targetPoint, itemColor, bucket.requiredRate, levelBaseY - (bucket.targetIndex + 1) * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      if (layoutInvalidReason) return false;
+      orderedSources.forEach((output, sourceIndex) => {
+        connectSplitterTree({ x: output.x, y: output.y }, sourceLeafPoints[sourceIndex], itemColor, output.rate || 0, levelBaseY + sourceIndex * PARALLEL_NODE_Y_STEP, itemName);
+      });
+      return !layoutInvalidReason;
+    }
+
+    debugLog(7, 15, "connectOutputsToTargets unsupported composition", {
+      itemName,
+      uniformSourceRates,
+      branchProduct,
+      leavesPerSource,
+      sourcesPerTarget
+    });
+    layoutInvalidReason = uniformSourceRates
+      ? `INVALID: many-to-many transform for ${itemName} requires unsupported split/merge composition.`
+      : `INVALID: many-to-many transform for ${itemName} has non-uniform source rates and cannot be composed with the current exact split-then-merge rules.`;
+    return false;
   }
 
   function buildNodeVisuals(node) {
@@ -1894,14 +2281,14 @@ function renderSolverBoard(solution) {
     const machineCount = Math.max(1, node.machineCount || 1);
     const instanceClocks = node.instanceClocks?.length ? node.instanceClocks : [100];
     const instanceRates = node.instanceRates?.length ? node.instanceRates : [node.actualRate || node.requiredRate || 0];
-    const instanceSpacing = 220;
+    const instanceSpacing = MACHINE_INSTANCE_SPACING;
     const machineCenters = Array.from({ length: machineCount }, (_, index) => pos.x + (index - (machineCount - 1) / 2) * instanceSpacing);
     const machineWidth = computeMachineWidth(children.length || 1);
     const machineBottomY = pos.y + machineHeight / 2;
     const machineTopY = pos.y - machineHeight / 2;
     const machineInputY = pos.y;
     const machineOutputY = pos.y;
-    const outputTipY = machineTopY - MACHINE_PORT_STEM - machineNodeGap - 38;
+    const outputTipY = machineTopY - MACHINE_PORT_STEM - MACHINE_NODE_GAP - OUTPUT_TIP_OFFSET;
     const outputItemColor = getNodeItemColor(node, itemMap);
     const inputColors = children.map((child) => getNodeItemColor(child, itemMap));
     const machineColor = averageHexColors([...inputColors, outputItemColor]);
@@ -1909,18 +2296,20 @@ function renderSolverBoard(solution) {
     const machineInputSlots = machineCenters.map((centerX) => getMachineInputSlotXs(centerX, machineWidth, children.length || 1));
     const machineArrowProtection = machineHeight / 2 + ROUTING_NODE_DIAMETER;
 
-    const splitterY = machineBottomY + machineNodeGap + 46;
-    const mergerY = machineTopY - machineNodeGap - 46;
+    const splitterY = machineBottomY + MACHINE_NODE_GAP + SPLITTER_VERTICAL_OFFSET;
+    const mergerY = machineTopY - MACHINE_NODE_GAP - MERGER_VERTICAL_OFFSET;
 
     children.forEach((child, index) => {
       const childVisual = buildNodeVisuals(child);
+      const childOutputs = childVisual.outputs || [{ x: childVisual.outputX, y: childVisual.outputY, rate: childVisual.rate }];
+      const recipeOutputQty = parseNumber(node.recipe?.outputQty) || 0;
+      const recipeInputQty = parseNumber((node.recipe?.inputs || []).find((row) => row.itemId === (child.outputItemId || child.itemId))?.qty) || 0;
       const directParallel =
         machineCount > 1 &&
-        childVisual.outputs &&
-        childVisual.outputs.length === machineCount;
+        childOutputs.length === machineCount;
 
       if (directParallel) {
-        const orderedOutputs = [...childVisual.outputs].sort((a, b) => a.x - b.x);
+        const orderedOutputs = [...childOutputs].sort((a, b) => a.x - b.x);
         orderedOutputs.forEach((output, outputIndex) => {
           const targetX = machineInputSlots[outputIndex][index] ?? machineCenters[outputIndex];
           addBelt(
@@ -1935,32 +2324,15 @@ function renderSolverBoard(solution) {
             `${node.label}:machine-input-${outputIndex + 1}-${index + 1}`
           );
         });
-      } else if (machineCount === 1) {
-        const targetX = machineInputSlots[0][index] ?? machineCenters[0];
-        addBelt(
-          belts,
-            childVisual.itemColor,
-            childVisual.rate,
-            compressPoints(routeHV({ x: childVisual.outputX, y: childVisual.outputY }, { x: targetX, y: machineInputY })),
-            child.label,
-            0,
-            machineArrowProtection,
-            `${child.label}:output`,
-            `${node.label}:machine-input-${index + 1}`
-          );
       } else {
         const targetPoints = machineCenters.map((centerX, machineIndex) => ({
           x: machineInputSlots[machineIndex][index] ?? centerX,
-          y: machineInputY
+          y: machineInputY,
+          rate: recipeOutputQty > 0 && recipeInputQty > 0
+            ? (instanceRates[machineIndex] || 0) * (recipeInputQty / recipeOutputQty)
+            : 0
         }));
-        connectSplitterTree(
-          { x: childVisual.outputX, y: childVisual.outputY },
-          targetPoints,
-          childVisual.itemColor,
-          childVisual.rate,
-          splitterY + index * 16,
-          child.label
-        );
+        if (!connectOutputsToTargets(childOutputs, targetPoints, childVisual.itemColor, splitterY + index * PARALLEL_NODE_Y_STEP, child.label, machineArrowProtection)) return;
       }
     });
 
@@ -1969,10 +2341,10 @@ function renderSolverBoard(solution) {
     if (machineCount === 1) {
       addBelt(outputBelts, outputItemColor, outputRate, [{ x: machineCenters[0], y: machineOutputY }, { x: machineCenters[0], y: outputTipY }], node.label, machineArrowProtection, 0, `${node.label}:machine-output`, `${node.label}:output-tip`);
     } else {
-      const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: machineTopY - machineNodeGap }));
+      const sourcePoints = machineCenters.map((centerX) => ({ x: centerX, y: machineTopY - MACHINE_NODE_GAP }));
       machineCenters.forEach((centerX, machineIndex) => {
         const instanceRate = instanceRates[machineIndex] || 0;
-        addBelt(outputBelts, outputItemColor, instanceRate, [{ x: centerX, y: machineOutputY }, { x: centerX, y: machineTopY - machineNodeGap }], node.label, machineArrowProtection, 0, `${node.label}:machine-output-${machineIndex + 1}`, `${node.label}:merge-source-${machineIndex + 1}`);
+        addBelt(outputBelts, outputItemColor, instanceRate, [{ x: centerX, y: machineOutputY }, { x: centerX, y: machineTopY - MACHINE_NODE_GAP }], node.label, machineArrowProtection, 0, `${node.label}:machine-output-${machineIndex + 1}`, `${node.label}:merge-source-${machineIndex + 1}`);
       });
       connectMergerTree(sourcePoints, { x: pos.x, y: outputTipY }, outputItemColor, outputRate, mergerY, node.label);
     }
@@ -1983,11 +2355,19 @@ function renderSolverBoard(solution) {
       renderedNodes.push(`
         <g class="factory-machine">
           <rect x="${centerX - machineWidth / 2}" y="${pos.y - machineHeight / 2}" width="${machineWidth}" height="${machineHeight}" fill="${machineColor}" stroke="rgba(60,48,31,0.85)" stroke-width="2"></rect>
-          <text x="${centerX}" y="${pos.y - 12}" text-anchor="middle" class="factory-machine-label" fill="${machineTextColor}">${escapeHtml(node.machineName)}</text>
-          <text x="${centerX}" y="${pos.y + 8}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${node.label} · ${fmt(instanceRate)} item/min`)}</text>
-          <text x="${centerX}" y="${pos.y + 28}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${fmt(instanceClock)}%`)}</text>
+          <text x="${centerX}" y="${pos.y + MACHINE_LABEL_LINE_1_OFFSET}" text-anchor="middle" class="factory-machine-label" fill="${machineTextColor}">${escapeHtml(node.machineName)}</text>
+          <text x="${centerX}" y="${pos.y + MACHINE_LABEL_LINE_2_OFFSET}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${node.label} - ${fmt(instanceRate)} item/min`)}</text>
+          <text x="${centerX}" y="${pos.y + MACHINE_LABEL_LINE_3_OFFSET}" text-anchor="middle" class="factory-machine-sub" fill="${machineTextColor}">${escapeHtml(`${fmt(instanceClock)}%`)}</text>
         </g>
       `);
+      machineMeta.push({
+        label: node.label,
+        machineName: node.machineName,
+        x: centerX - machineWidth / 2,
+        y: pos.y - machineHeight / 2,
+        width: machineWidth,
+        height: machineHeight
+      });
       extendBounds(layoutBounds, centerX - machineWidth / 2, pos.y - machineHeight / 2);
       extendBounds(layoutBounds, centerX + machineWidth / 2, pos.y + machineHeight / 2);
     });
@@ -2002,7 +2382,7 @@ function renderSolverBoard(solution) {
       rate: outputRate,
       outputs: machineCenters.map((centerX, machineIndex) => ({
         x: centerX,
-        y: machineTopY - machineNodeGap,
+        y: machineTopY - MACHINE_NODE_GAP,
         rate: instanceRates[machineIndex] || 0
       }))
     };
@@ -2014,7 +2394,55 @@ function renderSolverBoard(solution) {
     beltCount: belts.length,
     outputBeltCount: outputBelts.length
   });
+
+  const validateLaidOutElements = () => {
+    const minimumMachineGap = ROUTING_NODE_DIAMETER * APP_CONFIG.belt.machineSpacingDiameterMultiplier;
+    for (let i = 0; i < machineMeta.length; i += 1) {
+      for (let j = i + 1; j < machineMeta.length; j += 1) {
+        const a = machineMeta[i];
+        const b = machineMeta[j];
+        const horizontalGap = Math.max(0, Math.max(a.x, b.x) - Math.min(a.x + a.width, b.x + b.width));
+        const verticalGap = Math.max(0, Math.max(a.y, b.y) - Math.min(a.y + a.height, b.y + b.height));
+        if (horizontalGap < minimumMachineGap && verticalGap < minimumMachineGap) {
+          layoutInvalidReason = `INVALID: machine spacing below required minimum between ${a.machineName} and ${b.machineName}.`;
+          return;
+        }
+      }
+    }
+
+    for (let i = 0; i < routingNodeMeta.length; i += 1) {
+      for (let j = i + 1; j < routingNodeMeta.length; j += 1) {
+        const a = routingNodeMeta[i];
+        const b = routingNodeMeta[j];
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance < ROUTING_NODE_DIAMETER * 2 - 1e-9) {
+          layoutInvalidReason = "INVALID: splitter/merger nodes are too close to each other.";
+          return;
+        }
+      }
+    }
+
+    for (const belt of [...belts, ...outputBelts]) {
+      if (!belt.startConnection || !belt.endConnection) {
+        layoutInvalidReason = "INVALID: every belt must have start_connection and end_connection.";
+        return;
+      }
+      if (!belt.segments.length) {
+        layoutInvalidReason = "INVALID: belt has no drawable segments.";
+        return;
+      }
+      if (belt.segments.some((segment) => segmentLength(segment) <= 0)) {
+        layoutInvalidReason = "INVALID: belt contains a zero-length segment.";
+        return;
+      }
+    }
+  };
+
+  validateLaidOutElements();
   if (layoutInvalidReason) {
+    lastBoardValidationError = layoutInvalidReason;
     return `
       <svg viewBox="0 0 1200 480" role="img" aria-label="Solver board">
         <text x="600" y="200" text-anchor="middle" class="board-placeholder">No layout</text>
@@ -2063,11 +2491,10 @@ function renderSolverBoard(solution) {
       extendBounds(layoutBounds, segment.x2, segment.y2);
     });
   });
-  const padding = 48;
-  const shiftX = Number.isFinite(layoutBounds.minX) ? Math.max(0, padding - layoutBounds.minX) : 0;
-  const shiftY = Number.isFinite(layoutBounds.minY) ? Math.max(0, padding - layoutBounds.minY) : 0;
-  const contentWidth = Number.isFinite(layoutBounds.maxX) ? layoutBounds.maxX - layoutBounds.minX + padding * 2 : width;
-  const contentHeight = Number.isFinite(layoutBounds.maxY) ? layoutBounds.maxY - layoutBounds.minY + padding * 2 : height;
+  const shiftX = Number.isFinite(layoutBounds.minX) ? Math.max(0, BOARD_PADDING - layoutBounds.minX) : 0;
+  const shiftY = Number.isFinite(layoutBounds.minY) ? Math.max(0, BOARD_PADDING - layoutBounds.minY) : 0;
+  const contentWidth = Number.isFinite(layoutBounds.maxX) ? layoutBounds.maxX - layoutBounds.minX + BOARD_PADDING * 2 : width;
+  const contentHeight = Number.isFinite(layoutBounds.maxY) ? layoutBounds.maxY - layoutBounds.minY + BOARD_PADDING * 2 : height;
   const viewWidth = Math.max(width, contentWidth);
   const viewHeight = Math.max(height, contentHeight);
   debugLog(7, 5, "Viewport resolved", { layoutBounds, shiftX, shiftY, viewWidth, viewHeight });
@@ -2264,6 +2691,9 @@ function renderRecipeModal() {
   const validation = getRecipeValidation(draft);
   const duplicateInputIds = validation.duplicateInputIds;
   const outputSelectableItems = items.filter((item) => !roleState.externalInputIds.has(item.id));
+  const invalidSelectedOutput = draft.outputItemId && !outputSelectableItems.some((item) => item.id === draft.outputItemId)
+    ? roleState.itemMap.get(draft.outputItemId)
+    : null;
 
   root.innerHTML = `
     <div class="modal-backdrop" data-recipe-modal-close></div>
@@ -2284,6 +2714,7 @@ function renderRecipeModal() {
           <label class="field-label">Produced item</label>
           <select data-recipe-draft="outputItemId">
             <option value="">Select output item</option>
+            ${invalidSelectedOutput ? `<option value="${invalidSelectedOutput.id}" selected>${escapeHtml(`${invalidSelectedOutput.name} (INVALID: INPUT item)`)}</option>` : ""}
             ${outputSelectableItems.map((item) => `<option value="${item.id}" ${item.id === draft.outputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
           </select>
           <label class="field-label" style="margin-top:8px">Output quantity per craft</label>
@@ -2311,6 +2742,7 @@ function renderRecipeModal() {
             `;
           }).join("")}
         </div>
+        ${draft.outputItemId && !validation.outputRoleValid ? `<p style="color:red">Produced item must be a NOT INPUT item.</p>` : ""}
         ${draft.machineClassId && !validation.inputCountAllowed ? `<p style="color:red">Filled input count ${validation.filledInputCount} does not match the selected machine class allowed set.</p>` : ""}
         ${validation.incompleteFilledRows ? `<p style="color:red">Each filled input row must have both an item and a quantity greater than 0.</p>` : ""}
       </div>
@@ -2424,8 +2856,10 @@ function render() {
   const itemStatuses = getItemRowStatuses();
   const machineStatuses = getMachineClassStatuses();
   const duplicateRecipes = solution.duplicateIds;
-  const beltSpeedOptions = getSettingsNumbers().beltSpeeds.map((entry) => entry.speedText);
   const targetItems = items.filter((item) => !roleState.externalInputIds.has(item.id));
+  const invalidSelectedTarget = state.settings.targetOutputItemId && !targetItems.some((item) => item.id === state.settings.targetOutputItemId)
+    ? roleState.itemMap.get(state.settings.targetOutputItemId)
+    : null;
   const clockMin = getClockSliderValue(state.settings.clockMin || 25);
   const clockMax = 100;
   const sliderLeft = ((clockMin - CLOCK_SLIDER_MIN) / (CLOCK_SLIDER_MAX - CLOCK_SLIDER_MIN)) * 100;
@@ -2435,10 +2869,16 @@ function render() {
     "Machine inputs remain bottom-only and machine outputs remain top-center only."
   ];
   const exampleEdgeCases = [
-    "A target that exceeds raw input supply stays invalid and reports the exact missing quantity.",
+    "A target that exceeds the fastest available belt is scaled down and recomputed.",
     "A flow above the fastest belt speed emits a warning and continues with the fastest belt.",
     "Duplicate recipes are marked and ignored after the first matching instance."
   ];
+  const boardMarkup = renderSolverBoard(solution);
+  const combinedErrors = lastBoardValidationError
+    ? [...solution.errors, lastBoardValidationError]
+    : solution.errors;
+  const uniqueCombinedErrors = [...new Set(combinedErrors)];
+  const effectiveReachable = solution.reachable && !lastBoardValidationError;
 
   document.getElementById("app").innerHTML = `
     <div class="top-area">
@@ -2463,7 +2903,7 @@ function render() {
           <div class="stack">
             ${state.itemRows.map((row, index) => `
               <div class="item-row ${itemStatuses.get(row.id)?.valid ? "valid" : ""}">
-                <div class="row cols-4">
+                <div class="row cols-5">
                   <div>
                     <label class="field-label">Item name</label>
                     <input type="text" value="${escapeHtml(row.name)}" data-item-field="name" data-item-id="${row.id}">
@@ -2471,6 +2911,13 @@ function render() {
                   <div>
                     <label class="field-label">Item color</label>
                     <input type="text" value="${escapeHtml(row.color)}" data-item-field="color" data-item-id="${row.id}">
+                  </div>
+                  <div>
+                    <label class="field-label">Role</label>
+                    <select data-item-field="role" data-item-id="${row.id}">
+                      <option value="input" ${row.role !== "not-input" ? "selected" : ""}>INPUT</option>
+                      <option value="not-input" ${row.role === "not-input" ? "selected" : ""}>NOT INPUT</option>
+                    </select>
                   </div>
                   <div>
                     <label class="field-label">Color</label>
@@ -2500,21 +2947,11 @@ function render() {
                   <div class="item-name">${escapeHtml(item.name)}</div>
                   <div class="color-chip" style="background:${escapeHtml(item.color)}"></div>
                 </div>
-                <div class="subtle">External input belts</div>
-                <div class="belt-rows">
-                  ${(() => {
-                    const realInputExists = hasRealBeltInput(item);
-                    return item.belts.map((belt, beltIndex) => `
-                      <div class="belt-row">
-                        <select data-belt-item="${item.id}" data-belt-id="${belt.id}">
-                          ${beltIndex === 0 ? `<option value="__ONLY_OUTPUT__" ${!realInputExists ? "selected" : ""}>ONLY OUTPUT</option>` : ""}
-                          ${beltIndex > 0 ? `<option value="" ${belt.value === "" ? "selected" : ""}></option>` : ""}
-                          ${beltSpeedOptions.map((speed) => `<option value="${escapeHtml(speed)}" ${String(belt.value) === speed ? "selected" : ""}>${escapeHtml(speed)}</option>`).join("")}
-                        </select>
-                        <span class="unit">item/min</span>
-                      </div>
-                    `).join("");
-                  })()}
+                <div class="subtle">${roleState.externalInputIds.has(item.id) ? "INPUT" : "NOT INPUT"}</div>
+                <div class="footnote">
+                  ${roleState.externalInputIds.has(item.id)
+                    ? "Explicit external source item. Required rate is derived by the solver."
+                    : "Explicit produced item. Demand is solved backward from the selected target."}
                 </div>
               </div>
             `).join("") : `
@@ -2553,6 +2990,7 @@ function render() {
               <label class="field-label">Target output item</label>
               <select data-setting="targetOutputItemId">
                 <option value="">Select target</option>
+                ${invalidSelectedTarget ? `<option value="${invalidSelectedTarget.id}" selected>${escapeHtml(`${invalidSelectedTarget.name} (INVALID: INPUT item)`)}</option>` : ""}
                 ${targetItems.map((item) => `<option value="${item.id}" ${item.id === state.settings.targetOutputItemId ? "selected" : ""}>${escapeHtml(item.name)}</option>`).join("")}
               </select>
             </div>
@@ -2585,22 +3023,26 @@ function render() {
         <section class="panel">
           <h2>Result Summary</h2>
           <div class="summary-list">
-            <div class="stat-row"><div>Target reachable</div><div class="value ${solution.reachable ? "ok-text" : "warning-text"}">${solution.reachable ? "Yes" : "No"}</div></div>
+            <div class="stat-row"><div>Target reachable</div><div class="value ${effectiveReachable ? "ok-text" : "warning-text"}">${effectiveReachable ? "Yes" : "No"}</div></div>
+            <div class="stat-row"><div>Achieved output</div><div class="value">${fmt(solution.producedTargetRate || 0)} / ${fmt(solution.requestedTargetRate || 0)} item/min</div></div>
             <div class="stat-row"><div>Machine classes</div><div class="value">${machineClasses.length}</div></div>
             <div class="stat-row"><div>Total power</div><div class="value ${solution.totalPower > getSettingsNumbers().maxPower ? "danger-text" : ""}">${fmt(solution.totalPower || 0)} / ${fmt(getSettingsNumbers().maxPower)} MW</div></div>
             <div class="stat-row"><div>Overflow belts</div><div class="value">${solution.overflowBelts.length}</div></div>
           </div>
 
-          <h3>External Input Totals</h3>
+          <h3>Required External Inputs</h3>
           <div class="summary-list">
-            ${items.length ? items.map((item) => `<div class="stat-row"><div>${escapeHtml(item.name)}</div><div class="value">${fmt(solution.externalTotals.get(item.id) || 0)} item/min</div></div>`).join("") : `<div class="footnote">No items defined yet.</div>`}
+            ${items.length ? items
+              .filter((item) => roleState.externalInputIds.has(item.id))
+              .map((item) => `<div class="stat-row"><div>${escapeHtml(item.name)}</div><div class="value">${fmt(solution.externalDemand.get(item.id) || 0)} item/min</div></div>`)
+              .join("") || `<div class="footnote">No external input items are required for the current target.</div>` : `<div class="footnote">No items defined yet.</div>`}
           </div>
 
           <h3>Warnings And Errors</h3>
           <div class="summary-list">
             ${solution.warnings.length ? solution.warnings.map((warning) => `<div class="mini-summary warning-text">${escapeHtml(warning)}</div>`).join("") : ""}
-            ${solution.errors.length ? solution.errors.map((error) => `<div class="mini-summary danger-text">${escapeHtml(error)}</div>`).join("") : ""}
-            ${!solution.warnings.length && !solution.errors.length ? `<div class="mini-summary ok-text">No active warnings. The solver has a consistent state.</div>` : ""}
+            ${uniqueCombinedErrors.length ? uniqueCombinedErrors.map((error) => `<div class="mini-summary danger-text">${escapeHtml(error)}</div>`).join("") : ""}
+            ${!solution.warnings.length && !uniqueCombinedErrors.length ? `<div class="mini-summary ok-text">No active warnings. The solver has a consistent state.</div>` : ""}
           </div>
         </section>
       </div>
@@ -2677,7 +3119,7 @@ function render() {
       <div class="summary-strip">
         <div class="mini-summary">
           <h4>Validation Result</h4>
-          <div class="footnote ${solution.reachable ? "ok-text" : "danger-text"}">${solution.reachable ? "VALID" : "INVALID"}</div>
+          <div class="footnote ${effectiveReachable ? "ok-text" : "danger-text"}">${effectiveReachable ? "VALID" : "INVALID"}</div>
         </div>
         <div class="mini-summary">
           <h4>Machine Plan</h4>
@@ -2721,9 +3163,9 @@ function render() {
           <div class="footnote">Automatically derived geometric belt plan for the current target output.</div>
           </div>
         </div>
-        <div class="board-stage">${renderSolverBoard(solution)}</div>
+        <div class="board-stage">${boardMarkup}</div>
     </section>
-    ${solution.errors.length ? `<div class="app-errors">${solution.errors.map((error) => `<p style="color:red">${escapeHtml(error)}</p>`).join("")}</div>` : ""}
+    ${uniqueCombinedErrors.length ? `<div class="app-errors">${uniqueCombinedErrors.map((error) => `<p style="color:red">${escapeHtml(error)}</p>`).join("")}</div>` : ""}
   `;
 
   attachEvents();
@@ -2795,22 +3237,6 @@ function attachEvents() {
     };
   });
 
-  app.querySelectorAll("[data-belt-item]").forEach((input) => {
-    input.onchange = (event) => {
-      const row = state.itemRows.find((entry) => entry.id === input.dataset.beltItem);
-      const belt = row?.belts.find((entry) => entry.id === input.dataset.beltId);
-      if (!row || !belt) return;
-      if (event.target.value === "__ONLY_OUTPUT__") {
-        row.belts = [emptyBeltRow()];
-        render();
-        return;
-      }
-      belt.value = event.target.value;
-      ensureTrailingBelts(row);
-      render();
-    };
-  });
-
   app.querySelectorAll("[data-machine-field]").forEach((input) => {
     input.oninput = (event) => {
       const row = state.machineClassRows.find((entry) => entry.id === input.dataset.machineId);
@@ -2870,7 +3296,6 @@ function attachEvents() {
     };
     input.onblur = () => {
       commitSettings();
-      sanitizeBeltSelections(state);
       render();
     };
     input.onkeydown = (event) => {

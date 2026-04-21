@@ -2,15 +2,15 @@
     "belt":  {
                  "parallelOverlapStep":  18,
                  "arrowMinOffset":  8,
+                 "machineSpacingDiameterMultiplier":  1,
                  "minWidth":  8,
                  "minimumRatio":  0.35,
                  "arrowSize":  7,
                  "arrowSpacing":  42,
                  "baseStroke":  4,
+                 "protectedZoneDiameterMultiplier":  1,
                  "extraStroke":  4,
-                 "laneSpacingMultiplier":  2,
-                 "machineSpacingDiameterMultiplier":  1,
-                 "protectedZoneDiameterMultiplier":  1
+                 "laneSpacingMultiplier":  2
              },
     "clock":  {
                   "step":  1,
@@ -21,7 +21,7 @@
     "storageKey":  "flowforge-state-v2",
     "defaults":  {
                      "enableOverflow":  true,
-                     "maxPower":  1000,
+                     "targetOutputRate":  60,
                      "beltSpeeds":  [
                                         {
                                             "speed":  60,
@@ -44,7 +44,7 @@
                                             "color":  "orange"
                                         }
                                     ],
-                     "targetOutputRate":  60
+                     "maxPower":  1000
                  },
     "geometry":  {
                      "machineLabelLine1Offset":  -12,
@@ -70,7 +70,7 @@
                   "clockExponent":  1.321928
               },
     "routing":  {
-                    "crossingDashRadiusMultiplier":  3,
+                    "crossingDashRadiusMultiplier":  2,
                     "validationRadius":  20,
                     "mergerSizes":  [
                                         2,

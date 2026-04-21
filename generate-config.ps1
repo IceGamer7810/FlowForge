@@ -14,7 +14,7 @@ $defaultJson = @'
     "splitterSizes": [2, 3],
     "mergerSizes": [2, 3],
     "validationRadius": 20,
-    "crossingDashRadiusMultiplier": 3
+    "crossingDashRadiusMultiplier": 2
   },
   "geometry": {
     "routingNodeRadius": 10,

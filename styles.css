@@ -101,6 +101,7 @@ button, input, select, textarea { font: inherit; }
 .row.cols-2 { grid-template-columns: 1fr 1fr; }
 .row.cols-3 { grid-template-columns: 1.4fr 1fr auto; }
 .row.cols-4 { grid-template-columns: 1fr 1fr 1fr auto; }
+.row.cols-5 { grid-template-columns: 1.2fr 1fr 1fr auto auto; }
 
 .field-label {
   display: block;
@@ -777,6 +778,6 @@ svg { width: 100%; display: block; min-height: 430px; }
 @media (max-width: 760px) {
   .app { width: min(100%, calc(100% - 18px)); }
   .recipes-grid { grid-template-columns: 1fr; }
-  .process-row, .row.cols-3, .row.cols-4, .clock-values { grid-template-columns: 1fr; }
+  .process-row, .row.cols-3, .row.cols-4, .row.cols-5, .clock-values { grid-template-columns: 1fr; }
   .modal-row, .modal-two-col { grid-template-columns: 1fr; }
 }
